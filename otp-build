@@ -1,6 +1,6 @@
-#!/bin/bash -e
+#!/usr/bin/env python3
 # ========================================================================
-# Copyright (c) 2014-2022 T. R. Burghart.
+# Copyright (c) 2014-2024 T. R. Burghart.
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -15,438 +15,1515 @@
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 # ========================================================================
 #
-# Builds a relocatable OTP release optimized for the machine building it.
+# Usage: otp.build <otp-release> [-h|--help] [<option> ...]
 #
-# * The latest suitable OpenSSL crypto library is statically linked.
+# OTP Releases:
 #
-# * Option: wxWidgets-dependent applications can be included, requiring
-#   a local installation of the wxWidgets libraries.
+#   As of this writing, releases >= OTP-25 should build and run fine with any
+#   of the available options.
+#   Below that, things start to get dicey, particularly with wxWidgets.
+#   The script tells you if you're trying to build something that's known not
+#   to work, but various combinations of OS, CPU, and tools can break in a
+#   variety of ways that haven't been tested.
+#   If you're building the java library OR the docs for OTP < 22, you'll want
+#   to use Java 1.8 - some newer versions MAY work, but the latest will not.
 #
-# * Option: HTML documentation can be generated, with an encompassing index.
+# Executable Paths:
 #
-# * Option: OpenSSL, OTP, and Rebar3 tests can be run.
+#   Executable programs are located on the system $PATH.
+#   Located programs that are not found in 'standard' system directories cause
+#   a warning to be displayed prior to the confirmation query.
+#   Be sure to confirm that these are the programs you intend to use before
+#   confirming the build.
 #
-# !!! This script outputs a LOT of text,
-# !!! redirecting to a log file is strongly recommended.
+# Minimum Python Version:
 #
-# Usage: otp.build [options] <otp-release>
+#   The code checks for its necessary release support, which MAY be higher
+#   than the default installation on some platforms.
+#   For reference, a brief list of versions and the features they add that may
+#   be used here:
+#       3.10    Adds match/case (switch) syntax. Unused.
+#       3.8     Adds ':=' assignment (the walrus operator). Used throughout.
+#       3.6     This is truly the minimal usable version.
 #
-# Where:
+# OTP Source:
 #
-#   <otp-release> is a positive integer
+#   By default, OTP is pulled from the reference GitHub repository on the
+#   appropriate maintenance branch.
+#   See the OTP_ORIGIN and OTP_BRANCH globals below to override the defaults.
 #
-# Options:
+# Rebar Versions:
 #
-#   -d  generate documentation
-#   -k  keep the build working directory
-#   -o  directory in which to create artifacts, default $PWD
-#   -p  portable, do not optimize for the specific machine CPU
-#   -t  run OpenSSL, OTP, and Rebar3 tests
-#   -w  with wxWdgets and dependant apps, default off
+#   Rebar/Rebar3 is bundled for convenience, with no assurance that the
+#   selected version is suitable for your needs.
+#   The version selection is performed in the RebarRepo.__init__() function
+#   should you wish to adjust it.
 #
-# Artifacts are overwritten without warning!
+# WTF, Why is ths script so huge?
 #
-#   directory otp-<otp-release>
-#   archive otp-<otp-release>.tgz
-#   test archives otp-<otp-release>-*-tests.tgz
+#   Yes, you can build OTP with a much less elaborate script, or you could
+#   just use kerl. This script provides a plethora of switches, and it also
+#   serves as a testbed for stuff I may use in other places.
+#   Don't like it? Don't use it.
 #
 
-readonly pwd="$(pwd)"
-readonly scr="${0##*/}"
+# You can override the repository and/or branches from which you pull the
+# OTP source. This is primarily in support of old releases that were patched
+# by third parties for performance or stability; it's probably not desirable
+# for recent OTP releases.
+# Note that OTP_ORIGIN applies to ALL releases!
+OTP_ORIGIN = 'https://github.com/erlang/otp.git'
+# OTP_BRANCH is a dict of {OtpRelease : int => BranchName : str} mappings that
+# is consulted to override using the default 'maint-*' branch for that release.
+OTP_BRANCH = {}
 
-dest_dir="$pwd"
-keep_bld='false'
-portable='false'
-run_tests='false'
-with_docs='false'
-with_wx='false'
+# Minimum and maximum currently supported OTP releases.
+# Note that there's no guarantee they'll all build or run.
+MIN_REL: int = 15
+MAX_REL: int = 27
 
-usage()
-{
-    echo "Usage: $scr [-dpw] [-c <cache-dir>] [-o <otp-base-dir>] <otp-release>" >&2
-    echo 'Where:' >&2
-    echo '  <otp-release> is a positive integer' >&2
-    echo 'Options:' >&2
-    echo '  -d  generate documentation' >&2
-    echo '  -k  keep the build working directory' >&2
-    echo '  -o  directory in which to create artifacts, default $PWD' >&2
-    echo '  -p  portable, do not optimize for the specific machine CPU' >&2
-    echo '  -t  run OpenSSL, OTP, and Rebar3 tests' >&2
-    echo '  -w  with wxWdgets and dependant apps, default off' >&2
-    exit 1
-}
+import sys
 
-while getopts ':dko:ptw' flag
-do
-    case "$flag" in
-        d)
-            with_docs='true'
-            ;;
-        k)
-            keep_bld='true'
-            ;;
-        o)
-            if ! [[ -n "$OPTARG" && -d "$OPTARG" ]]
-            then
-                echo "${scr}: invalid destination directory: '${OPTARG}'" >&2
-                exit 2
-            fi
-            dest_dir="$(cd "$OPTARG" && pwd)"
-            ;;
-        p)
-            portable='true'
-            ;;
-        t)
-            run_tests='true'
-            ;;
-        w)
-            with_wx='true'
-            ;;
-        '?')
-            [[ "$OPTARG" == h || "$OPTARG" == - ]] || \
-            echo "${scr}: illegal option '${OPTARG}'" >&2
-            usage
-            ;;
-    esac
-done
-shift $(($OPTIND - 1))
+py_req = (3, 8, 0)
+py_vsn = sys.version_info[:3]
+py_msg = '.'.join([str(i) for i in py_vsn])
+py_msg = 'Using Python ' + py_msg + '.'
+if py_vsn < py_req:
+    print(py_msg, file=sys.stderr)
+    py_msg = '.'.join([str(i) for i in py_req])
+    py_msg = 'Minimum version ' + py_msg + ' required, cannot continue.'
+    print(py_msg, file=sys.stderr)
+    sys.exit(1)
+print(py_msg)
+del py_msg
+del py_req
+del py_vsn
 
-case $# in
-    0)
-        echo "${scr}: Missing required OTP release" >&2
-        usage
-        ;;
-    1)
-        if [[ "$1" =~ ^[1-9][0-9]*$ ]]
-        then
-            declare -i otp_rel="$1"
-        else
-            echo "${scr}: Non-integral OTP release '$1'" >&2
-            usage
-        fi
-        ;;
-    *)
-        echo "${scr}: Invalid command parameters" >&2
-        usage
-        ;;
-esac
+import abc
+import argparse
+import atexit
+import io
+import logging
+import os
+import pathlib
+import platform
+import pprint
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import urllib.parse
+import urllib.request
 
-if [[ $otp_rel -lt 21 ]]
-then
-    echo "${scr}: Unsupported OTP release '$1'" >&2
-    exit 1
-elif [[ $otp_rel -gt 29 ]]
-then
-    echo "${scr}: Script update required for OTP release '$1'" >&2
-    exit 1
-fi
+from typing import Any, Callable, NoReturn, Union
 
-if $with_docs
-then
-    if [[ -z "$JAVA_HOME" ]]
-    then
-        echo "${scr}: \$JAVA_HOME must be set to generate documentation" >&2
-        exit 5
-    elif [[ ! -d "$JAVA_HOME" ]]
-    then
-        echo "${scr}: Invalid \$JAVA_HOME: '${JAVA_HOME}'" >&2
-        exit 5
-    fi
-fi
+# ========================================================================
+# Main program
+# ========================================================================
 
-if $with_wx && ! type -P wx-config &>/dev/null
-then
-    echo "${scr}: wx-config not found on \$PATH" >&2
-    exit 5
-fi
+Exe = str
+CompilerFamily = Union['gcc', 'clang']
+Vsn = tuple[int, ...]
+Compiler = tuple[CompilerFamily, Vsn, Exe, Exe]
+Config = dict[str, Union[bool, int, str, tuple[int, ...], Compiler, None]]
 
-if [[ $otp_rel -lt 25 ]]
-then
-    declare -i ssl_rel=1
-    ssl_branch='OpenSSL_1_1_1-stable'
-else
-    declare -i ssl_rel=3
-    ssl_branch='openssl-3.1'
-fi
+class Main():
 
-os_name="$(uname -s)"
-os_vers="$(uname -r)"
-os_arch="$(uname -m)"
-git_exe="$(type -P git)"
+    def run(self):
+        rundir = os.getcwd()
+        parser = self._parser()
+        conf = parser.parse_args(sys.argv[1:]).__dict__
+        # Validate/fixup the config
+        rel = conf['rel']
+        if rel < MIN_REL or rel > MAX_REL:
+            parser.error(
+                f"Release {rel} outside supported range {MIN_REL}..{MAX_REL}")
+        if work := conf['work']:
+            work = _ensure_dir(work)
+            conf['keep'] = True
+        else:
+            work = tempfile.mkdtemp(prefix='otpb.', dir='/tmp')
+        conf['work'] = work
+        if out := conf['out']:
+            out = _ensure_dir(out)
+        else:
+            out = rundir
+        conf['out'] = out
+        if inst := conf['inst']:
+            inst = _ensure_dir(inst)
+        if not (log := conf['log']):
+            log = os.path.join(out, 'log')
+        conf['log'] = log = _ensure_dir(log)
+        self._platform_setup(conf)
+        self._find_exes(conf)
+        for f in _platform_check:
+            ok, info = f(conf)
+            if not ok:
+                msg = f"OTP-{rel} is not supported on this platform: {info}"
+                _error_exit(msg)
+        conf_text = self._config_block(conf)
+        if conf['doit'] or self._confirm(conf_text):
+            bld_log_name = f"otp-{conf['rel']}-build.log"
+            bld_log_path = os.path.join(log, bld_log_name)
+            _start_log(bld_log_path)
+            _banner(conf_text)
+            self.build(conf)
+        # This should always be the last operation - if any error occurs
+        # anywhere, we don't want this to execute.
+        if not conf['keep']:
+            if work and work.startswith('/tmp/otpb.') and os.path.isdir(work):
+                print('Cleaning up ...')
+                # Let's not delete our own current directory, eh?
+                _ch_dir(rundir)
+                # Brute force for speed
+                cmd = ['/bin/rm', '-rf', work]
+                _exe_run(cmd)
+            else:
+                err = "working directory '" + work \
+                      + "' NOT deleted due to predicate violation!"
+                _error_exit(err)
+        _clean_exit()
 
-run()
-{
-    echo '==>' "$@" >&2
-    "$@"
-}
+    def build(self, conf: Config) -> None:
+        self._build_setup(conf)
+        _dbg_env('Build Environment')
+        _dbg_cfg(conf, 'Build Configuration')
+        self._setup_wx(conf)
+        OpenSSLRepo(conf).build(conf)
+        self._reset_bldenv(conf)
+        otp_repo = OTPRepo(conf)
+        otp_repo.build(conf)
+        self._reset_bldenv(conf)
+        RebarRepo(conf).build(conf)
+        otp_repo.finish(conf)
+        _dbg_cfg(conf, 'Final Configuration')
+        print(f"Build logs stored in '{conf['log']}'")
 
-git()
-{
-    run "$git_exe" "$@"
-}
+    @staticmethod
+    def _build_setup(conf: Config) -> None:
+        os_arch = conf['os_arch']
+        os_cpus = conf['os_cpus']
+        os_type = conf['os_type']
+        systype = os_type + '-' + os_arch
+        if os_type == 'Darwin':
+            if conf['os_arch'] == 'x86_64':
+                # account for hyperthreading
+                os_cpus /= 2
+            mac_vsn = _exe_cap(['/usr/bin/sw_vers', '-productVersion'])
+            mac_vsn = tuple(int(s) for s in mac_vsn.split('.'))
+            if mac_vsn[0] < 11:
+                min_vsn = '10.9'
+            else:
+                min_vsn = str(mac_vsn[0]) + '.0'
+            conf['mac_vsn'] = mac_vsn
+            conf['mac_min_vsn'] = min_vsn
+        if conf['fast'] and os_cpus > 3:
+            bld_cpus = int((os_cpus * 3) / 4)
+        else:
+            bld_cpus = 1
+        conf['bld_cpus'] = bld_cpus
+        conf['make_jflag'] = f"-j{bld_cpus}" if bld_cpus > 1 else None
+        conf['systype'] = systype
+        Main._reset_bldenv(conf)
+        # Clear any environment variables that MAY lead a process to believe
+        # it's running somewhere that ASCII escape codes are recognized.
+        patt = re.compile(r'^(COLOR|ITERM_|LC_|TERM)')
+        remove = []
+        for key in os.environ.keys():
+            if patt.match(key):
+                remove.append(key)
+        for key in remove:
+            del os.environ[key]
+        # Now set a few that should hopefully keep things quiet.
+        os.environ['LANG'] = 'C'
+        os.environ['LC_ALL'] = 'C'
+        os.environ['TERM'] = 'dumb'
+        os.environ['REBAR_COLOR'] = 'none'
 
-repos="/tmp/${scr}.$(/bin/date '+%Y%m%d.%H%M%S')"
-[[ -d "$repos" ]] || run /bin/mkdir "$repos"
+    @staticmethod
+    def _setup_wx(conf: Config) -> None:
+        wx : Union[bool, str] = conf['wx']
+        # Do not simplify - could be an executable path, we want to confirm
+        # it's an explicit boolean.
+        if wx is True:
+            WxRepo(conf).build(conf)
+            Main._reset_bldenv(conf)
+        elif wx:
+            vers = _exe_cap([wx, '--version'])
+            conf['wx_man'] = WxRepo._manifest(WxRepo._label, vers)
 
-otp_dir="$dest_dir/otp-$otp_rel"
+    @staticmethod
+    def _confirm(conf_text: str) -> bool:
+        print(conf_text, end='\n\n')
+        valid = {
+            '': False, 'n': False, 'no': False,
+            'y': True, 'yes': True
+        }
+        prompt = 'Accept this configuration and build? [y/N]: '
+        while True:
+            sys.stdout.write(prompt)
+            answer = input().lower()
+            if answer in valid:
+                return valid[answer]
+            else:
+                sys.stdout.write("Respond 'y[es]' or 'n[o]'. ")
 
-echo
-echo "Working directory '${repos}'"
-if $keep_bld
-then
-    echo 'This directory will be left intact'
-else
-    echo 'On failure this directory will be left intact'
-fi
-echo
-echo "Target OTP Release:     $otp_rel"
-echo "Platform:               $os_name $os_vers $os_arch"
-echo "Destination Directory:  $otp_dir"
-echo "With Documentation:     $with_docs"
-echo "With wxWidgets:         $with_wx"
-echo
+    @staticmethod
+    def _config_block(conf: Config) -> str:
+        lines = (
+            'Effective Configuration:\n',
+            f"  OTP release:                {conf['rel']}",
+            f"  Working directory:          {conf['work']}",
+            f"  Keep working directory:     {conf['keep']}",
+            f"  Archive output directory:   {conf['out']}",
+            f"  Log directory:              {conf['log']}",
+            f"  Installation directory:     {conf['inst']}",
+            f"  With documentation:         {conf['docs']}",
+            f"  With wxWidgets:             {conf['wx']}",
+            f"  With jinterface:            {conf['java']}",
+            f"  Optimize for this CPU:      {conf['native']}",
+            f"  Use lots of CPUs to build:  {conf['fast']}",
+            f"  Run all tests:              {conf['test']}",
+            f"  Compiler:                   {conf['compiler']}",
+            f"  Git:                        {conf['git']}",
+            f"  GNU make:                   {conf['gmake']}",
+            f"  System make:                {conf['make']}",
+            f"  Perl:                       {conf['perl']}",
+            f"  Sed:                        {conf['sed']}",
+            f"  Tar:                        {conf['tar']}",
+            f"  Run without confirmation:   {conf['doit']}"
+        )
+        return '\n'.join(lines)
 
-# huge repo, and we don't need to search for a tag, so just take the tip of the branch
-git clone --quiet --branch "maint-$otp_rel" --single-branch --depth 1 'http://github.com/erlang/otp.git' "$repos/otp"
+    @staticmethod
+    def _find_exes(conf: Config) -> None:
+        git = _find_exe('git')
+        perl = _find_exe('perl')
+        sed = _find_exe('sed')
+        tar = _find_exe('tar')
+        make, gmake = _find_make()
+        conf['compiler'] = _find_compiler(conf)
+        conf['git'] = git
+        conf['gmake'] = gmake
+        conf['make'] = make
+        conf['perl'] = perl
+        conf['sed'] = sed
+        conf['tar'] = tar
 
-# we'll be searching for the last release tag, so don't restrict depth
-git clone --quiet 'http://github.com/erlang/rebar3.git' "$repos/rebar3"
-git clone --quiet --branch "$ssl_branch" --single-branch 'http://github.com/openssl/openssl.git' "$repos/openssl"
+    @staticmethod
+    def _platform_setup(conf: Config) -> None:
+        os_arch = platform.machine()
+        os_cpus = os.cpu_count()
+        os_type = platform.system()
+        os_vsn = platform.release()
+        os_vsn = tuple(int(s) for s in os_vsn.split('.') if s.isdecimal())
+        conf['os_arch'] = os_arch
+        conf['os_cpus'] = os_cpus
+        conf['os_type'] = os_type
+        conf['os_vsn'] = os_vsn
 
-#
-# OTP maint-xx branch should always be at a release tag.
-# Rebar3 tags don't contain '-', so we can easily find the last tagged release.
-# OpenSSL tag patterns depend on version, takes a bit more work.
-#
-otp_vsn=$(< "$repos/otp/OTP_VERSION")
+    @staticmethod
+    def _reset_bldenv(conf: Config) -> None:
+        # Everybody starts with a clean environment
+        for evar in Main._clear_evars:
+            os.environ.pop(evar, None)
+        fam, vsn, cc, cxx = conf['compiler']
+        os.environ['CC'] = cc
+        os.environ['CXX'] = cxx
 
-rebar_vsn=$("$git_exe" -C "$repos/rebar3" describe | cut -d- -f1)
-git -C "$repos/rebar3" checkout --quiet "$rebar_vsn"
+    @staticmethod
+    def _parser() -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser(
+            # Support linefeeds in 'description' and 'epilog'.
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            # Keep this in sync manually because I don't want to figure out
+            # how the formatter assembles it, but I DO want OtpRelease as the
+            # first parameter, as it can be confused for an optional argument
+            # if it's at the end.
+            usage='%(prog)s OtpRelease'
+                  ' [-h] [-a] [-b Dir] [-c] [-d] [-f] [-i Dir] [-j] [-k]'
+                  ' [-l Dir] [-m] [-n] [-o Dir] [-t] [-w [Exe]] [-y]',
+            description='Build and install OTP',
+            epilog="[1] Releases prior to OTP 21 are sketchy, at best, with"
+                   " minimal, if any, testing.\n"
+                   "[2] The -d and -j options rely on whatever version of java is"
+                   " found on the $PATH. If it matters to you, ensure that it's"
+                   " the version you want.\n"
+                   "[3] At most one directory level will be created! \n"
+                   "* Blatantly invalid options and compilation failures should"
+                   " be reported politely, but some runtime errors will result"
+                   " in an exception and stacktrace.")
+        parser.add_argument(
+            'rel', metavar='OtpRelease', type=int,
+            help=f"OTP release in the range {MIN_REL}..{MAX_REL} [1]")
+        parser.add_argument(
+            '-a', '--arch', action='store_true',
+            help="""
+                Create an archive of the installation directory in --out.
+                If --inst is not specified this is implicit.""")
+        parser.add_argument(
+            '-b', '--base', dest='work', metavar='Dir',
+            help="""
+                Base working directory under which repos will be cloned or
+                used, implies --keep. Default is created under /tmp and
+                deleted when finished successfully. [3]""")
+        parser.add_argument(
+            '-c', '--clean', action='store_true',
+            help="""
+                Clear previous build elements in the specified --base
+                directory. When re-using a base working directory, the script
+                re-uses applicable previously-built components. This switch
+                forces those components to be rebuilt, and should always be
+                used following a failure or change in command-line options.""")
+        parser.add_argument(
+            '-d', '--docs', action='store_true',
+            help="Generate OTP documentation. [2]")
+        parser.add_argument(
+            '-f', '--fast', action='store_true',
+            help="""
+                Build quickly, using most CPU cores.
+                This is likely to make other operations on the machine run
+                significantly slower.""")
+        parser.add_argument(
+            '-i', '--inst', metavar='Dir',
+            help="""
+                Install the release in <Dir>.
+                Also see --arch and --meta. [3]""")
+        parser.add_argument(
+            '-j', '--java', action='store_true',
+            help="Build the jinterface library. [2]")
+        parser.add_argument(
+            '-k', '--keep', action='store_true',
+            help="""
+                Keep the (created) build working directory.
+                On failure, or if explicitly specified with --base,
+                the directory is always kept.""")
+        parser.add_argument(
+            '-l', '--log', metavar='Dir',
+            help="Write build logs to <Dir>, default <Out>/log. [3]")
+        parser.add_argument(
+            '-m', '--meta', action='store_true',
+            help="""
+                Store build metadata and activation scripts in the
+                installation directory.
+                If --inst is not specified this is implicit, so that these
+                files make their way into the archive.""")
+        parser.add_argument(
+            '-n', '--native', action='store_true',
+            help="""
+                Optimize for this computer's specific CPU.
+                The release MAY NOT run properly, or at all, on other
+                computers.""")
+        parser.add_argument(
+            '-o', '--out', metavar='Dir',
+            help="""
+                Directory in which to create artifacts.
+                Default CWD. [3]""")
+        parser.add_argument(
+            '-t', '--test', action='store_true',
+            help="Run tests on all built components.")
+        parser.add_argument(
+            '-w', '--wx', metavar='Exe',
+            nargs='?', const=True, default=False,
+            help="""
+                Build with wxWidgets and dependant apps. If specified without
+                a parameter a suitable wxWidgets version supported by the
+                target OTP release will be built.
+                The full path to a desired wx-config program known to support
+                the target release can be specified explicitly, but beware that
+                this option modifies the $PATH during the OTP build which MAY
+                cause unintended side-effects.""")
+        parser.add_argument(
+            '-y', '--yes', dest='doit', action='store_true',
+            help="""
+                Accept the calculated build configuration without confirmation.
+                NOT recommended!""")
+        return parser
 
-if [[ $ssl_rel -lt 2 ]]
-then
-    ssl_vsn=$("$git_exe" -C "$repos/openssl" describe | cut -d- -f1)
-    git -C "$repos/openssl" checkout --quiet "$ssl_vsn"
-    ssl_vsn=${ssl_vsn#OpenSSL_}
-    ssl_vsn=${ssl_vsn//_/.}
-else
-    ssl_vsn=$("$git_exe" -C "$repos/openssl" describe | cut -d- -f1,2)
-    git -C "$repos/openssl" checkout --quiet "$ssl_vsn"
-    ssl_vsn=${ssl_vsn#openssl-}
-fi
+    # Environment variables that MAY interfere with building.
+    # Each build operation may manipulate these.
+    # CC and CXX are directly reset before each build phase.
+    _clear_evars = (
+        'AR', 'ARFLAGS', 'AS', 'ASFLAGS',
+        'CFLAGS', 'CXXFLAGS', 'CPP', 'CPPFLAGS', 'CPPDEFINES', 'CPPINCLUDES',
+        'LD', 'LDFLAGS', 'LDLIBS', 'MAKE', 'MAKEFLAGS', 'RANLIB', 'RM'
+    )
 
-#
-# Figure out which app/switches to include/exclude
-#
-declare -a otp_apps
 
-otp_apps+=( '--without-javac' )
-otp_apps+=( '--without-jinterface' )
-otp_apps+=( '--without-megaco' )
-otp_apps+=( '--without-odbc' )
+# function returning tuple(ok, why)
+SupportedFunResult = tuple[bool, str]
+SupportedFunction = Callable[[Config], SupportedFunResult]
+_platform_check: list[SupportedFunction] = []
 
-if [[ -d "$repos/otp/lib/hipe" ]]
-then
-    otp_apps+=( '--disable-hipe' '--without-hipe' )
-fi
 
-# smoke tests use SNMP
-if ! $run_tests
-then
-    # if otp_mibs is present then os_mon requires it and hence snmp
-    if [[ ! -d "$repos/otp/lib/otp_mibs" ]]
-    then
-        otp_apps+=( '--without-snmp' )
-    fi
-fi
+# ========================================================================
+# Subordinate classes
+# ========================================================================
 
-if ! $with_wx
-then
-    otp_apps+=( '--without-wx' )
-    otp_apps+=( '--without-debugger' )
-    otp_apps+=( '--without-et' )
-    otp_apps+=( '--without-observer' )
-fi
+class Repo(abc.ABC):
 
-echo
-echo 'Building:'
-echo "  OTP version:      $otp_vsn"
-echo "  OpenSSL version:  $ssl_vsn"
-echo "  Rebar version:    $rebar_vsn"
-echo
+    def branch(self) -> str:
+        return self._branch
 
-#
-# Purify the environment
-#
-unset   AR ARFLAGS AS ASFLAGS CC CFLAGS CXX CXXFLAGS CPP CPPFLAGS \
-        CPPDEFINES CPPINCLUDES LD LDFLAGS LDLIBS MAKE MAKEFLAGS RANLIB RM
-LANG=C
-TERM=dumb
-REBAR_COLOR=none
-export  LANG TERM REBAR_COLOR
+    @abc.abstractmethod
+    def build(self, conf: Config) -> None:
+        pass
 
-case "$os_name" in
-    Darwin)
-        CC='/usr/bin/cc'
-        CXX='/usr/bin/c++'
-        cpx='cp -pX'
-        open_html='run open'
-        os_cflags="-mmacosx-version-min=$(
-            sw_vers -productVersion | cut -d. -f1).0"
-        os_makeflags="-j$(($(sysctl -n hw.ncpu) / 2))"
-        ;;
-    Linux)
-        CC='/usr/bin/cc'
-        CXX='/usr/bin/c++'
-        cpx='cp -p'
-        open_html='true'
-        os_cflags=''
-        os_makeflags="-j$(($(nproc) - 1))"
-        ;;
-    *)
-        CC='/usr/bin/cc'
-        CXX='/usr/bin/c++'
-        cpx='cp -p'
-        open_html='true'
-        os_cflags=''
-        os_makeflags="-j$(($(sysctl -n hw.ncpu) - 1))"
-        ;;
-esac
-export  CC CXX
+    @abc.abstractmethod
+    def label(self) -> str:
+        pass
 
-#
-# OpenSSL
-#
-run cd "$repos/openssl"
+    @staticmethod
+    def _manifest(label: str, version: str) -> str:
+        return label + ': ' + version
 
-ssl_inst="$repos/openssl-inst"
+    def manifest(self) -> str:
+        return self._manifest(self.label(), self.version())
 
-export  KERNEL_BITS=64
-case $ssl_rel in
-    1)
-        run ./config "--prefix=$ssl_inst" "--openssldir=$ssl_inst/ssl" \
-            --release $os_cflags shared enable-ec_nistp_64_gcc_128
-        ;;
-    3)
-        run ./Configure "--prefix=$ssl_inst" "--openssldir=$ssl_inst/ssl" \
-            --release $os_cflags no-makedepend no-module no-shared \
-            enable-ec_nistp_64_gcc_128
-        ;;
-    *)
-        echo "${scr}: Unsupported OpenSSL release '${ssl_rel}'" >&2
-        exit 5
-        ;;
-esac
+    def name(self) -> str:
+        return self._name
 
-run make
-if $run_tests ; then run make test ; fi
-run make install_sw
-unset   KERNEL_BITS
+    def origin(self) -> str:
+        return self._origin
 
-#
-# Erlang/OTP
-#
-run cd "$repos/otp"
+    def path(self) -> str:
+        return self._path
 
-declare -a otp_opts
-otp_opts+=( '--enable-m64-build' )
-otp_opts+=( "--with-ssl=$ssl_inst" )
-otp_opts+=( '--disable-dynamic-ssl-lib' )
-otp_opts+=( "${otp_apps[@]}" )
+    @abc.abstractmethod
+    def version(self) -> str:
+        pass
 
-CFLAGS="-O3 -g0 -w $os_cflags"
-$portable || CFLAGS+=" -march=native -mtune=native"
-CXXFLAGS="$CFLAGS"
-LDFLAGS="-O3 -g0 $os_cflags"
-ERL_TOP="$repos/otp"
-MAKE="$(type -P make)"
-[[ "$($MAKE --version 2>/dev/null | head -1)" == GNU\ [Mm]ake\ * ]] \
-    || MAKE="$(type -P gmake || echo gmake)"
-MAKEFLAGS="$os_makeflags"
+    def vsn_ints(self) -> tuple[int, ...]:
+        if not (vsn := self._vsn_ints):
+            vsn = tuple(int(s) for s in self.version().split('.'))
+            self._vsn_ints = vsn
+        return vsn
 
-export  CFLAGS CXXFLAGS LDFLAGS ERL_TOP MAKE MAKEFLAGS
+    def __init__(self, conf: Config, origin: str, branch: str):
+        git = conf['git']
+        self.__git_exe = git
+        self._vsn_ints = None
+        self._branch = branch
+        self._config = None
+        self._origin = origin
+        o_parsed = urllib.parse.urlparse(origin)
+        o_path = pathlib.PurePath(o_parsed.path)
+        name = o_path.stem
+        path = os.path.join(conf['work'], name)
+        self._name = name
+        self._path = path
+        show = 'Initializing ' + name + ' repository ...'
+        print(show)
+        _banner(f"{show}\nIn '{path}'")
+        if os.path.isdir(os.path.join(path, '.git', 'refs')):
+            self._git_run(['reset', '--quiet', '--hard'])
+            self._clean()
+            self._git_run(['fetch', '--quiet', 'origin', branch])
+            self._git_run(['checkout', '--quiet', '--force', branch])
+            self._git_run(['branch', '--quiet',
+                           '--set-upstream-to=origin/' + branch, branch])
+        else:
+            print(f"Cloning {name} into '{path}' ...")
+            cmd = [git, 'clone', '--quiet', '--branch', branch, origin, path]
+            _exe_run(cmd)
 
-[[ ! -d "$otp_dir" ]] || run /bin/rm -rf "$otp_dir"
+    def _build_check(self, conf: Config, config: list[str]) -> bool:
+        """Return `True` if the required version build is reusable"""
+        file = self.path() + '-' + self.version() + '.built'
+        if conf['clean']:
+            if os.path.isfile(file):
+                os.remove(file)
+            return False
+        body: str = conf['systype'] + ' ' + ' '.join(config)
+        self._config = body
+        self._cffile = file
+        if os.path.isfile(file):
+            if _read_file(file) == body:
+                return True
+            os.remove(file)
+        return False
 
-run ./otp_build setup -a "--prefix=$otp_dir" "${otp_opts[@]}"
-run $MAKE install
-if $with_docs
-then
-    export  FOP_OPTS='-Xmx1024m'
-    # docs may fail if not building with wx
-    if run $MAKE docs install-docs DOC_TARGETS=html
-    then
-        run ln -s lib/erlang/doc/index.html "$otp_dir/index.html"
-        $open_html "$otp_dir/index.html" || true
-    fi
-fi
+    def _build_mark(self) -> None:
+        _write_file(self._cffile, self._config)
 
-#
-# Rebar
-#
-run cd "$repos/rebar3"
+    def _clean(self):
+        self._git_run(['clean', '--quiet', '-dffx'])
 
-path="$PATH"
-export  PATH="$ERL_TOP/bin:$path"
-hash -r 2>/dev/null || true
-run ./bootstrap
-export  PATH="$path"
-hash -r 2>/dev/null || true
-unset   path
+    def _git_cap(self, cmd: list[str]) -> str:
+        return _exe_cap([self.__git_exe, '-C', self._path] + cmd)
 
-#
-# Complete the install and archive it
-#
-run cd "$otp_dir"
+    def _git_run(self, cmd: list[str]) -> None:
+        _exe_run([self.__git_exe, '-C', self._path] + cmd)
 
-# get the list of OTP executables *before* installing rebar
-otp_exes=($(/bin/ls bin))
 
-run install -m 0755 "$repos/rebar3/rebar3" bin
-run install -m 0644 "$repos/otp/OTP_VERSION" .
+class OTPRepo(Repo):
 
-cat <<EOF > manifest.mf
-Erlang/OTP: $otp_vsn
-OpenSSL: $ssl_vsn
-Rebar: $rebar_vsn
-EOF
-chmod 0644 manifest.mf
+    def build(self, conf: Config) -> None:
+        docs = conf['docs']
+        inst = conf['inst']
+        rel = conf['rel']
+        test = conf['test']
+        work = conf['work']
+        wx = conf['wx']
+        vsn = self.version()
+        bld = self.path()
+        if not inst:
+            inst = os.path.join(work, 'otp-inst-' + vsn)
+            conf['inst'] = inst
+            conf['arch'] = True
+            conf['meta'] = True
+        name = self.label() + ' ' + vsn
+        show = 'Configuring ' + name + ' ...'
+        print(show)
+        _banner(f"{show}\nIn '{bld}'")
+        _ch_dir(bld)
+        envpath = None
+        doctars = None
+        if not os.path.isfile('configure'):
+            _exe_run(['./otp_build', 'autoconf'])
+        if docs:
+            # If we need to download files, do it now to report any
+            # failures early.
+            if not wx:
+                # Docs won't build if the wx apps aren't built.
+                if rel > 20:
+                    doctars = self._fetch_docs(conf)
+                else:
+                    msg = 'WARNING: Documentation MAY NOT build properly' \
+                          ' with this configuration!'
+                    print(msg)
+                    _banner(msg)
+            elif rel >= 27:
+                ex_doc_path = self._setup_exdoc(conf)
+                envpath = _prefix_path(ex_doc_path)
+        # Notable release changes
+        # 22? parallel compile added - don't use make -jN
+        # 19  --enable-darwin-64bit removed from docs
+        # 2?  --enable-m64-build breaks
+        # 23  --enable-pie added
+        # 23  docs DOC_TARGETS added
+        # 24  HiPE removed
+        # 27  docs build switched from fop to ex_doc
+        # ??  ODBC compilable
+        cflags = '-O3 -g0 -w'
+        ldflags = '-O3 -g0'
+        # Use getcwd() to mimic what scripts get from `pwd -P`
+        erl_top = os.getcwd()
+        os_arch = conf['os_arch']
+        os_type = conf['os_type']
+        darwin = os_type == 'Darwin'
+        # linux   = os_type == 'Linux'
+        cmd = ['./configure', '--prefix=' + inst]
+        # if rel < 19 and darwin and os_arch == 'x86_64':
+        #     cmd.append('--enable-darwin-64bit')
+        # elif rel < 28:
+        #     cmd.append('--enable-m64-build')
+        if darwin:
+            cmd.append('--enable-darwin-64bit')
+        elif os_arch == 'x86_64':
+            cmd.append('--enable-m64-build')
+        # if rel >= 23 :
+        #     cmd.append('--enable-pie')
+        cmd.append('--with-ssl=' + conf['openssl_inst'])
+        cmd.append('--disable-dynamic-ssl-lib')
+        # Allow HiPE to be built to satisfy some Rebar versions' dependencies
+        # if os.path.isdir('lib/hipe') :
+        #     cmd.append('--disable-hipe')
+        #     cmd.append('--without-hipe')
+        if not test and not os.path.isdir('lib/otp_mibs'):
+            cmd.append('--without-snmp')
+        if conf['java']:
+            cmd.append('--with-javac')
+            cmd.append('--with-jinterface')
+        else:
+            cmd.append('--without-javac')
+            cmd.append('--without-jinterface')
+        if wx:
+            cmd.append('--with-wx')
+            # may make a difference on some versions/platforms?
+            cmd.append('--with-wx-config=' + wx)
+            prevpath = _prefix_path(os.path.dirname(wx))
+            if not envpath:
+                envpath = prevpath
+        else:
+            cmd.append('--without-wx')
+            cmd.append('--without-debugger')
+            cmd.append('--without-et')
+            cmd.append('--without-observer')
+        if darwin:
+            min_vsn = conf['mac_min_vsn']
+            # OTP-20 tells us to set this, by then ignores it :(
+            os.environ['MACOSX_DEPLOYMENT_TARGET'] = min_vsn
+            vsn_flag = ' -mmacosx-version-min=' + min_vsn
+            cflags += vsn_flag
+            ldflags += vsn_flag
+        if conf['native']:
+            cflags += ' -march=native -mtune=native'
+        # os.environ['CFLAGS'] = cflags
+        # os.environ['CXXFLAGS'] = cflags
+        # os.environ['LDFLAGS'] = ldflags
+        os.environ['ERL_TOP'] = erl_top
+        _exe_run(cmd)
+        make = conf['gmake']
+        makej = [make]
+        if jflag := conf['make_jflag']:
+            makej.append(jflag)
+        show = 'Building ' + name + ' ...'
+        print(show)
+        _banner(f"{show}\nIn '{bld}'")
+        cmd = makej if rel < 22 else [make]
+        _exe_run(cmd)
+        if test:
+            test_dir = os.path.join(bld, 'release', 'tests', 'test_server')
+            show = 'Testing ' + name + ' ...'
+            print(show)
+            _banner(f"{show}\nIn '{test_dir}'")
+            cmd.append('release_tests')
+            _exe_run(cmd)
+            _ch_dir(test_dir)
+            _exe_run([
+                os.path.join(bld, 'bin', 'erl'), '-s', 'ts', 'install',
+                '-s', 'ts', 'smoke_test', 'batch', '-s', 'init', 'stop'])
+            tar = os.path.join(conf['log'], 'otp-' + vsn + '-test.tgz')
+            _exe_run([conf['tar'], 'czf', tar, '.'])
+            results = os.path.join(test_dir, 'index.html')
+            if os.path.isfile(results):
+                _show_file(results, 'OTP Test Results')
+            _ch_dir(bld)
+        show = 'Installing ' + name + ' ...'
+        print(show)
+        _banner(f"{show}\nTo '{inst}'")
+        cmd.append('install')
+        _exe_run(cmd)
+        if docs:
+            if doctars:
+                show = 'Installing ' + name + ' docs ...'
+                print(show)
+                _banner(f"{show}\nTo '{inst}'")
+                docdir = os.path.join(inst, 'lib', 'erlang')
+                for tar in doctars:
+                    with tarfile.open(tar) as tf:
+                        msg = f"Extracting '{tar}' to '{docdir}' ..."
+                        print(msg, file=LOG_OUT)
+                        tf.extractall(docdir)
+            else:
+                show = 'Building ' + name + ' docs ...'
+                print(show)
+                _banner(f"{show}\nTo '{inst}'")
+                # newer docs builder expects $PATH to be $ERL_TOP:...
+                prevpath = _prefix_path(erl_top, os.path.join(erl_top, 'bin'))
+                if not envpath:
+                    envpath = prevpath
+                if rel < 27:
+                    os.environ['FOP_OPTS'] = '-Xmx1024m'
+                    cmd = [make, 'docs']
+                    # if rel > 22 :
+                    #     cmd.append('DOC_TARGETS=chunks,html,man')
+                else:
+                    cmd = makej
+                    cmd.append('docs')
+                _exe_run(cmd)
+                cmd = [make, 'install-docs']
+                _exe_run(cmd)
+        _restore_path(envpath)
+        conf['otp_man'] = self.manifest()
+        conf['otp_vsn'] = self.vsn_ints()
 
-cat <<EOF > relocate_here
-#!/bin/bash -e
+    def finish(self, conf: dict[str, ...]) -> None:
+        arch = conf['arch']
+        meta = conf['meta']
+        if not (arch or meta):
+            return
+        inst = conf['inst']
+        vers = self.version()
+        if meta:
+            _write_file(os.path.join(inst, 'OTP_VERSION'), vers, 0o0664)
+            manifest = [conf['otp_man'], conf['openssl_man'], conf['rebar_man']]
+            if wx_man := conf.get('wx_man'):
+                manifest.append(wx_man)
+            manifest = '\n'.join(manifest) + '\n'
+            _write_file(os.path.join(inst, 'OTP_MANIFEST'), manifest, 0o0664)
+            shutil.copy2(conf['rebar_exe'], os.path.join(inst, 'bin'))
+            relocate = RELOCATE.replace('@@SED@@', conf['sed'])
+            rel_file = os.path.join(inst, 'relocate_here')
+            act_file = os.path.join(inst, 'activate.in')
+            _write_file(rel_file, relocate, 0o0755)
+            _write_file(act_file, ACTIVATE, 0o0644)
+            docs_rel = 'lib/erlang/doc/index.html'
+            docs_src = os.path.join(inst, docs_rel)
+            docs_dst = os.path.join(inst, os.path.basename(docs_rel))
+            if os.path.isfile(docs_src):
+                if not os.path.isfile(docs_dst):
+                    os.symlink(docs_rel, docs_dst)
+                elif not os.path.samefile(docs_src, docs_dst):
+                    os.remove(docs_dst)
+                    os.symlink(docs_rel, docs_dst)
+                show = 'Installed Documentation: ' + docs_dst
+                print(show)
+                print(show, file=LOG_OUT)
+        if arch:
+            out = conf['out']
+            tar = os.path.join(out, f"otp-{vers}.tgz")
+            path, dir = os.path.split(inst)
+            _ch_dir(path)
+            _exe_run([conf['tar'], 'czf', tar, dir])
+        if meta:
+            # make sure it works, and create the 'activate' file
+            _exe_run([rel_file])
 
-otp_dir="\$(cd "\$(dirname "\$0")" && pwd)"
-"\$otp_dir/lib/erlang/Install" -minimal "\$otp_dir/lib/erlang" >/dev/null
+    def label(self) -> str:
+        return self._label
 
-bin_dir="\$otp_dir/bin"
-cd "\$bin_dir"
+    def version(self) -> str:
+        vsn = self.__vsn_str
+        if not vsn:
+            if self.__otp_rel < 17:
+                # have to parse it out of the makefiles
+                src = os.path.join(self._path, 'erts', 'vsn.mk')
+                body = _read_file(src)
+                lpat = r'^\s*SYSTEM_VSN\s*=\s*(\S+)\s*$'
+                vstr = re.findall(lpat, body, (re.ASCII | re.MULTILINE))[0]
+                # ex: R14B04 R15B03 R16B02 R16B03-1 R16B02_basho10
+                flds = re.findall(r'\d+', vstr)
+                # Convert them to ints to strip leading '0' characters, then
+                # back to strs so we can join them.
+                segs = [str(int(f)) for f in flds]
+                vsn = '.'.join(segs)
+            else:
+                src = os.path.join(self._path, 'OTP_VERSION')
+                vsn = _read_file(src).strip()
+            self.__vsn_str = vsn
+        return vsn
 
-for x in ${otp_exes[@]}
-do
-    /bin/ln -sf "../lib/erlang/bin/\$x" .
-done
+    def _fetch_docs(self, conf: Config) -> tuple[str, str]:
+        """Download html and manpage docs for OTP release >= 21"""
+        vsn = self.version()
+        tar_dir = os.path.join(conf['work'], 'otp_doc')
+        html_file = f"otp_doc_html_{vsn}.tar.gz"
+        man_file = f"otp_doc_man_{vsn}.tar.gz"
+        html_tar = os.path.join(tar_dir, html_file)
+        man_tar = os.path.join(tar_dir, man_file)
+        tar_files = html_tar, man_tar
+        needed = [f for f in tar_files if not os.path.isfile(f)]
+        if needed:
+            _ensure_dir(tar_dir)
+            src = f"https://github.com/erlang/otp/releases/download/OTP-{vsn}/"
+            for file in needed:
+                fn = os.path.basename(file)
+                url = src + fn
+                _download_binary(url, file, 0o0644)
+        return tar_files
+
+    @staticmethod
+    def _setup_exdoc(conf: Config) -> str:
+        rel = conf['rel']
+        work = conf['work']
+        ex_doc_dir = os.path.join(work, 'ex_doc')
+        ex_doc_name = f"ex_doc_otp_{rel}"
+        ex_doc_exe = os.path.join(ex_doc_dir, ex_doc_name)
+        if not os.path.isfile(ex_doc_exe):
+            _ensure_dir(ex_doc_dir)
+            opener = _url_opener()
+            url = 'https://github.com/elixir-lang/ex_doc/releases/latest'
+            req = urllib.request.Request(url, method='HEAD')
+            print('Retrieving ' + url, file=LOG_OUT)
+            rsp = opener.open(req)
+            # rsp.status *should* be 302, but allow for some wiggle room
+            if int(rsp.status / 100) != 3:
+                _error_exit(f"unexpected HTTP status {rsp.status}")
+            if not (loc := rsp.getheader('location')):
+                _error_exit("missing expected HTTP header 'location'")
+            exdoc_vsn = os.path.basename(loc)
+            url = 'https://github.com/elixir-lang/ex_doc/releases/download/' \
+                  + exdoc_vsn + '/' + ex_doc_name
+            _download_binary(url, ex_doc_exe, 0o0755)
+        ex_doc_link = os.path.join(ex_doc_dir, 'ex_doc')
+        if not os.path.isfile(ex_doc_link):
+            os.symlink(ex_doc_name, ex_doc_link)
+        elif not os.path.samefile(ex_doc_link, ex_doc_exe):
+            os.remove(ex_doc_link)
+            os.symlink(ex_doc_name, ex_doc_link)
+        print(f"Using '{ex_doc_exe}'", file=LOG_OUT)
+        return ex_doc_dir
+
+    def __init__(self, conf: dict[str, ...]):
+        otp_rel = conf['rel']
+        if otp_rel in OTP_BRANCH:
+            branch = OTP_BRANCH[otp_rel]
+        elif otp_rel < 17:
+            branch = f"maint-r{otp_rel}"
+        else:
+            branch = f"maint-{otp_rel}"
+        origin = OTP_ORIGIN
+        super().__init__(conf, origin, branch)
+        self.__otp_rel = otp_rel
+        self.__vsn_str = None
+
+    _label: str = 'OTP'
+
+
+def _otp_supported(conf: Config) -> SupportedFunResult:
+    os_type = conf['os_type']
+    os_arch = conf['os_arch']
+    systype = f"{os_type}-{os_arch}"
+    label = f"{OTPRepo._label}-{systype}"
+    if conf['rel'] >= 17:
+        return True, label
+    if os_arch == 'x86_64':
+        # x86_64 - drivers/common/inet_drv.c doesn't compile
+        return False, label
+    return True, label
+
+
+_platform_check.append(_otp_supported)
+
+
+class OpenSSLRepo(Repo):
+
+    def build(self, conf: Config) -> None:
+        work = conf['work']
+        vsn = self.version()
+        bld = self.path()
+        inst = os.path.join(work, 'openssl-inst-' + vsn)
+        name = self.label() + ' ' + vsn
+        vsn = self.vsn_ints()
+        # build config
+        os_arch = conf['os_arch']
+        os_type = conf['os_type']
+        darwin = os_type == 'Darwin'
+        linux = os_type == 'Linux'
+        os.environ['KERNEL_BITS'] = '64'
+        os.environ['OPENSSL_SOURCE'] = bld
+        cfg = [conf['perl'], os.path.join(self.path(), 'Configure')]
+        if vsn < (3, 0):
+            # Not needed for OTP, and will break the OTP build if
+            # enabled and not found.
+            # os.environ['CPPFLAGS'] = '-DOPENSSL_NO_KRB5'
+            if darwin:
+                target = 'darwin64-' + os_arch + '-cc'
+            elif linux:
+                target = 'linux-' + os_arch
+            else:
+                target = None
+            if target:
+                cfg.append(target)
+            else:
+                cfg = [os.path.join(self.path(), 'config')]
+            # enable-ec_nistp_64_gcc_128 <1.1 MAY not be compatible with
+            # modern CPUs
+            if vsn < (1, 1):
+                cfg_flags = ['no-krb5', 'shared']
+            else:
+                cfg.append('--release')
+                cfg_flags = ['shared', 'enable-ec_nistp_64_gcc_128']
+        else:
+            cfg.append('--release')
+            cfg_flags = ['no-makedepend', 'no-module', 'no-shared',
+                         'enable-ec_nistp_64_gcc_128']
+        cfg.append('--prefix=' + inst)
+        cfg.append('--openssldir=' + os.path.join(inst, 'ssl'))
+        if darwin:
+            cfg.append('-mmacosx-version-min=' + conf['mac_min_vsn'])
+        cfg += cfg_flags
+        if self._build_check(conf, cfg):
+            show = 'Reusing previously built ' + name
+            print(show)
+            _banner(f"{show}\nIn '{inst}'")
+        else:
+            _exe_run(['/bin/rm', '-rf', inst])
+            _ensure_dir(inst)
+            show = 'Configuring ' + name + ' ...'
+            print(show)
+            _banner(f"{show}\nIn '{bld}'")
+            _ch_dir(bld)
+            _exe_run(cfg)
+            make = [conf['make']]
+            if vsn > (3, 0) and (jflag := conf['make_jflag']):
+                make.append(jflag)
+            show = 'Building ' + name + ' ...'
+            print(show)
+            _banner(f"{show}\nIn '{bld}'")
+            if vsn < (3, 0):
+                _exe_run(make + ['depend'])
+            _exe_run(make)
+            if conf['test']:
+                if vsn < (1, 1):
+                    show = 'Skipping tests of ' + name \
+                           + ' - unstable on modern hardware'
+                    print(show)
+                    _banner(show)
+                else:
+                    show = 'Testing ' + name + ' ...'
+                    print(show)
+                    _banner(f"{show}\nIn '{bld}'")
+                    _exe_run(make + ['test'])
+            show = 'Installing ' + name + ' ...'
+            print(show)
+            _banner(f"{show}\nTo '{inst}'")
+            _exe_run(make + ['install_sw'])
+            self._build_mark()
+            del os.environ['KERNEL_BITS']
+            del os.environ['OPENSSL_SOURCE']
+        conf['openssl_inst'] = inst
+        conf['openssl_man'] = self.manifest()
+        conf['openssl_vsn'] = vsn
+
+    def label(self) -> str:
+        return self._label
+
+    def version(self) -> str:
+        return self.__vsn_str
+
+    def vsn_ints(self) -> tuple[int, ...]:
+        # Versions > 1.x (thankfully) have fully-numeric semvers ... so far.
+        # Still, assume any version string segment may be N[a-z]*, just to
+        # make the code simpler overall - speed isn't a factor here.
+        if not (vsn := self._vsn_ints):
+            segs = self.version().split('.')
+            abase = ord(b'a') - 1
+            li = []
+            for s in segs:
+                if s.isdecimal():
+                    li.append(int(s))
+                else:
+                    # integer with trailing letter(s)
+                    cnt = len(s)
+                    pos = 0
+                    while pos < cnt:
+                        next_pos = pos + 1
+                        if s[pos:next_pos].isdecimal():
+                            pos = next_pos
+                        else:
+                            if pos:
+                                li.append(int(s[:pos]))
+                            break
+                    n = 0
+                    while pos < cnt:  # should always be true initially
+                        next_pos = pos + 1
+                        c = s[pos:next_pos]
+                        pos = next_pos
+                        if c.islower():
+                            n += (ord(c) - abase)
+                        # else : we don't know this pattern, ignore c
+                    if n:
+                        li.append(n)
+            vsn = tuple(li)
+            self._vsn_ints = vsn
+        return vsn
+
+    def __init__(self, conf: Config) -> None:
+        otp_rel = conf['rel']
+        branch = OpenSSLRepo._rel_branch(otp_rel)
+        origin = 'https://github.com/openssl/openssl.git'
+        super().__init__(conf, origin, branch)
+        dsc = self._git_cap(['describe'])
+        # The tag starts with 'OpenSSL_' or 'openssl-', so the prefix is 8
+        # characters either way. Store it separately and partition after it,
+        # lest we cut at the '-' in the prefix, then re-assemble.
+        pre = dsc[:8]
+        vsn, sep, tail = dsc[8:].partition('-')
+        tag = pre + vsn
+        # .replace() isn't needed for v3+, but simplifies the code
+        vsn = vsn.replace('_', '.')
+        self.__vsn_tag = tag
+        self.__vsn_str = vsn
+        self._git_run(['checkout', '--quiet', tag])
+
+    @staticmethod
+    def _rel_branch(rel: int) -> str:
+        if rel < 17:
+            return 'OpenSSL_1_0_2-stable'
+        if rel < 25:
+            return 'OpenSSL_1_1_1-stable'
+        return 'openssl-3.0'
+
+    _label: str = 'OpenSSL'
+
+
+def _openssl_supported(conf: Config) -> SupportedFunResult:
+    os_type = conf['os_type']
+    os_arch = conf['os_arch']
+    systype = f"{os_type}-{os_arch}"
+    label = f"{OpenSSLRepo._label}-{systype}"
+    if conf['rel'] >= 17 or os_arch == 'x86_64':
+        return True, label
+    if os_type != 'Linux':
+        return False, label
+    return True, label
+
+
+_platform_check.append(_openssl_supported)
+
+
+class RebarRepo(Repo):
+
+    def build(self, conf: Config) -> None:
+        vsn = self.version()
+        bld = self.path()
+        name = self.label() + ' ' + vsn
+        show = 'Building ' + name + ' ...'
+        print(show)
+        _banner(f"{show}\nIn '{bld}'")
+        _ch_dir(bld)
+        envpath = _prefix_path(os.path.join(conf['inst'], 'bin'))
+        _exe_run(['./bootstrap'])
+        if conf['test']:
+            show = 'Testing ' + name + ' ...'
+            print(show)
+            _banner(f"{show}\nIn '{bld}'")
+            if self.__major < 3:
+                # Some Rebar v2 tests are likely to fail because it's
+                # all just so old.
+                _exe_run(['./rebar', 'eunit'], True)
+            else:
+                _exe_run(['./rebar3', 'ct'])
+                test_dir = os.path.join(bld, '_build', 'test', 'logs')
+                _ch_dir(test_dir)
+                tarname = f"rebar-{vsn}-{conf['rel']}-test.tgz"
+                tar = os.path.join(conf['log'], tarname)
+                _exe_run(['/usr/bin/tar', 'czf', tar, '.'])
+                results = os.path.join(test_dir, 'index.html')
+                if os.path.isfile(results):
+                    _show_file(results, 'Rebar Test Results')
+        _restore_path(envpath)
+        conf['rebar_exe'] = os.path.join(bld, self.name())
+        conf['rebar_man'] = self.manifest()
+        conf['rebar_vsn'] = self.vsn_ints()
+
+    def label(self) -> str:
+        return self._label
+
+    def version(self) -> str:
+        return self.__vsn_str
+
+    def __init__(self, conf: Config) -> None:
+        otp_rel = conf['rel']
+        if otp_rel < 17:
+            branch = 'master'
+            origin = 'https://github.com/rebar/rebar.git'
+            major = 2
+        else:
+            branch = 'v3.13' if otp_rel < 23 else 'main'
+            origin = 'https://github.com/erlang/rebar3.git'
+            major = 3
+        super().__init__(conf, origin, branch)
+        self.__major = major
+        # Latest tags in v2 repo are not annotated
+        cmd = ['describe', '--tags'] if major < 3 else ['describe']
+        dsc = self._git_cap(cmd)
+        tag, sep, tail = dsc.partition('-')
+        self.__vsn_tag = tag
+        self.__vsn_str = tag
+        self._git_run(['checkout', '--quiet', tag])
+
+    _label: str = 'Rebar'
+
+
+class WxRepo(Repo):
+
+    def build(self, conf: Config) -> None:
+        work = conf['work']
+        rel = conf['rel']
+        vsn = self.version()
+        bld = os.path.join(work, 'wx-build-' + vsn)
+        inst = os.path.join(work, 'wx-inst-' + vsn)
+        name = self.label() + ' ' + vsn
+        vsn = self.vsn_ints()
+        # build config
+        cfg = [os.path.join(self.path(), 'configure'),
+               f"--prefix={inst}", '--disable-shared']
+        if rel >= 24:
+            cfg.append('--enable-webview')
+        # elif vsn >= (3, 1) :
+        # Do NOT use the --enable-compat28 flag for OTP
+        # Causes "error: call to member function 'AddTool' is ambiguous"
+        # cfg.append('--enable-compat28')
+        if conf['os_type'] == 'Darwin':
+            cfg.append('--with-cocoa')
+            cfg.append('--with-macosx-version-min=' + conf['mac_min_vsn'])
+        else:
+            cfg.append('--with-gtk')
+            os.environ['CFLAGS'] = '-fPIC'
+            os.environ['CXXFLAGS'] = '-fPIC'
+        if self._build_check(conf, cfg):
+            show = 'Reusing previously built ' + name
+            print(show)
+            _banner(f"{show}\nIn '{inst}'")
+        else:
+            _exe_run(['/bin/rm', '-rf', bld, inst])
+            _ensure_dir(bld)
+            _ensure_dir(inst)
+            show = 'Configuring ' + name + ' ...'
+            print(show)
+            _banner(f"{show}\nIn '{bld}'")
+            _ch_dir(bld)
+            _exe_run(cfg)
+            make = [conf['make'], ]
+            if jflag := conf['make_jflag']:
+                make.append(jflag)
+            show = 'Building ' + name + ' ...'
+            print(show)
+            _banner(f"{show}\nIn '{bld}'")
+            _exe_run(make)
+            show = 'Installing ' + name + ' ...'
+            print(show)
+            _banner(f"{show}\nTo '{inst}'")
+            _exe_run(make + ['install'])
+            self._build_mark()
+        conf['wx'] = os.path.join(inst, 'bin', 'wx-config')
+        conf['wx_man'] = self.manifest()
+        conf['wx_vsn'] = vsn
+
+    def label(self) -> str:
+        return self._label
+
+    def version(self) -> str:
+        return self.__vsn_str
+
+    def __init__(self, conf: Config) -> None:
+        # Versions recommended by OTP build:
+        # OTP < 20 => wx 3.0 compat 2.8 x86 only?
+        # OTP 24 wx app rewritten for 3.0, --enable-webview
+        # OTP < 26 => wx 3.0/3.1 compat 2.8
+        # OTP < ?? => wx 3.2/3.3 compat 3.0
+        otp_rel = conf['rel']
+        use_v30 = otp_rel < 20
+        # use_v30 = otp_rel < 26
+        branch = 'WX_3_0_BRANCH' if use_v30 else 'master'
+        origin = 'https://github.com/wxWidgets/wxWidgets.git'
+        super().__init__(conf, origin, branch)
+        if use_v30:
+            dsc = self._git_cap(['describe'])
+            tag, sep, tail = dsc.partition('-')
+            vsn = tag[1:]
+        else:
+            if otp_rel < 26:
+                pat = 'v3.1.*'
+            else:
+                pat = 'v3.2.*'
+            tags = self._git_cap(['tag', '--list', pat]).split()
+            # Tags we care about look like 'vM.N.P', and we want to discard
+            # the ones that have a trailing '-<label>'.
+            # The order 'git tag --list' returns them in is not wholly
+            # reliable for our purposes, so we turn them into list[int] for
+            # sorting, then reassemble the latest one.
+            # The nested list comprehension may look ugly, but it's by far the
+            # most efficient way to get our list[list[int]].
+            vsns = [[int(s) for s in t[1:].split('.')]
+                    for t in tags if t[0] == 'v' and '-' not in t]
+            vint = sorted(vsns, reverse=True)[0]
+            vsn = '.'.join([str(i) for i in vint])
+            tag = 'v' + vsn
+        self.__vsn_tag = tag
+        self.__vsn_str = vsn
+        self._git_run(['checkout', '--quiet', tag])
+        self._git_run([
+            'submodule', '--quiet', 'update', '--init',
+            '--force', '--checkout', '--recursive'])
+
+    _label = 'wxWidgets'
+
+
+def _wx_supported(conf: Config) -> SupportedFunResult:
+    label = WxRepo._label
+    if not conf['wx']:
+        return True, label + ' disabled'
+    os_type = conf['os_type']
+    os_arch = conf['os_arch']
+    systype = f"{os_type}-{os_arch}"
+    label = f"{label}-{systype}"
+    rel = conf['rel']
+    if rel == 24:
+        # OTP wx app rewritten
+        if systype == 'Darwin-arm64':
+            return False, label + ' undefined NIF symbols'
+    # if conf['rel'] >= 17 :
+    #     return True, label
+    # if os_arch == 'x86_64' :
+    #     # x86_64 - drivers/common/inet_drv.c doesn't compile
+    #     return False, systype
+    return True, label
+
+
+_platform_check.append(_wx_supported)
+
+
+# Do not raise an exception on non-success result codes, so they can be
+# handled by evaluating http.client.HTTPResponse.status.
+class _UrlOpenerErrorHandler(urllib.request.HTTPErrorProcessor):
+    http_response = lambda self, request, response: response
+    https_response = http_response
+
+
+_opener: Union[urllib.request.OpenerDirector, None] = None
+
+
+def _url_opener() -> urllib.request.OpenerDirector:
+    global _opener
+    if not _opener:
+        _opener = urllib.request.build_opener(_UrlOpenerErrorHandler)
+    return _opener
+
+
+# ========================================================================
+# Helpers
+# ========================================================================
+
+BannerSource = Union[str, list[str], tuple[str, ...], dict[str, Any]]
+
+
+def _banner(source: BannerSource, heading=None) -> None:
+    print(_banner_text(source, heading), file=LOG_OUT)
+
+
+def _banner_text(source: BannerSource, heading=None) -> str:
+    if isinstance(source, str):
+        body = source
+    elif isinstance(source, dict):
+        body = pprint.pformat(source, indent=2, width=128)
+    else:
+        body = '\n'.join(source)
+    if heading:
+        body = heading + ':\n\n' + body
+    return '\n'.join((BANNER, body, BANNER))
+
+
+def _ch_dir(to_dir: str) -> None:
+    if to_dir != os.getcwd():
+        print(f"==> cd '{to_dir}'", file=LOG_OUT)
+        os.chdir(to_dir)
+
+
+def _clean_exit() -> NoReturn:
+    _stop_log()
+    print('done.')
+    sys.exit()
+
+def _download_binary(url: str, dest: str, mode: int) -> None:
+    _ensure_dir(os.path.dirname(dest))
+    opener = _url_opener()
+    headers = {'accept': 'application/octet-stream'}
+    req = urllib.request.Request(
+        url, headers=headers, method='GET')
+    print('Retrieving ' + url, file=LOG_OUT)
+    rsp = opener.open(req)
+    redirs = 0
+    while int(rsp.status / 100) == 3:
+        if redirs > 4:
+            _error_exit('too many redirections')
+        redirs += 1
+        url = rsp.getheader('location')
+        req = urllib.request.Request(
+            url, headers=headers, method='GET')
+        rsp = opener.open(req)
+    if rsp.status != 200:
+        _error_exit(f"unexpected response: {rsp.status}")
+    bin = rsp.read()
+    with open(dest, 'wb') as fd:
+        fd.write(bin)
+    os.chmod(dest, mode)
+
+
+def _error_exit(msg: Union[str, None], rc: int = 1) -> NoReturn:
+    if msg:
+        err_msg = 'Error: ' + msg
+    else:
+        err_msg = f"Failure: {rc}"
+    if _log_file:
+        if msg:
+            print(msg, file=LOG_ERR)
+        err_msg = f"{err_msg}\nRefer to '{_log_file}' for details."
+        _stop_log()
+    print(err_msg, file=sys.stderr)
+    sys.exit(rc)
+
+
+def _ensure_dir(path: str) -> str:
+    abs = os.path.abspath(path)
+    if not os.path.isdir(abs):
+        print(f"==> mkdir '{path}'", file=LOG_OUT)
+        if os.path.lexists(path):
+            _error_exit(f"'{path}' exists but is not a directory.")
+        parent = os.path.dirname(abs)
+        if not os.path.isdir(parent):
+            _error_exit(f"'{path}' parent is not a directory.")
+        if not os.access(parent, (os.W_OK | os.X_OK)):
+            _error_exit(f"'{path}' parent is not writable.")
+        os.mkdir(abs)
+    return abs
+
+def _exe_cap(cmd: list[str]) -> str:
+    print('==> ' + ' '.join(cmd), file=LOG_OUT)
+    res = subprocess.run(
+        cmd, check=False, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out = res.stdout.strip()
+    err = res.stderr.strip()
+    if rc := res.returncode:
+        if out:
+            print(out, file=LOG_OUT)
+        _error_exit(err, rc)
+    if err:
+        print(err, file=LOG_ERR)
+    return out
+
+def _exe_run(cmd: list[str], ignore_fail: bool = False) -> None:
+    print('==> ' + ' '.join(cmd), file=LOG_OUT)
+    # Logging should always be set up when this is called
+    res = subprocess.run(
+        cmd, check=False, stdout=_pipe_out, stderr=_pipe_err)
+    if rc := res.returncode and not ignore_fail:
+        _error_exit(None, rc)
+
+def _find_compiler(conf: Config) -> Compiler:
+    """Return (family, (version), cc_exe, c++_exe)"""
+    # Intel compilers only on x86_64 (duh) Mac or Linux
+    chk_icc = (conf['os_arch'] == 'x86_64' and
+               conf['os_type'] in ('Linux', 'Darwin'))
+    cc_srch = ['cc', 'clang', 'gcc']
+    if chk_icc:
+        cc_srch = ['icpx', 'icx', 'icc'] + cc_srch
+    for name in cc_srch:
+        if cc := _find_exe(name, True):
+            break
+    if not cc:
+        _error_exit('missing C compiler')
+    line = _exe_cap([cc, '--version']).split('\n')[0]
+    if chk_icc and (re.match(r'Intel\b', line) or
+                    re.search(r'\b\(ICC\)\b', line)):
+        fam = 'intel'
+    elif re.search(r'\bclang\b', line):
+        fam = 'clang'
+    elif re.search(r'\b\(GCC\)\b', line):
+        fam = 'gcc'
+    else:
+        fam = 'unknown'
+    if vsn := re.search(r'\b\d+(\.\d+){1,}\b', line):
+        vsn = tuple(int(s) for s in vsn[0].split('.'))
+    else:
+        vsn = (0,)
+    dn, fn = os.path.split(cc)
+    if fn == 'cc':
+        cxx = os.path.join(dn, 'c++')
+        if not os.path.isfile(cxx):
+            _error_exit('missing C++ compiler ' + cxx)
+    elif fn == 'gcc':
+        cxx = os.path.join(dn, 'g++')
+        if not os.path.isfile(cxx):
+            cxx = cc
+    else:
+        cxx = cc
+    return fam, vsn, cc, cxx
+
+_sys_exe_dirs = ('/bin', '/usr/bin', '/usr/local/bin')
+def _find_exe(name: str, check : bool = False) -> Union[str, None]:
+    if exe := shutil.which(name):
+        if os.path.dirname(exe) not in _sys_exe_dirs:
+            msg = f"using executable '{exe}' at non-standard location."
+            if _log_file:
+                logging.warning(msg)
+            print('Warning: ' + msg, file=sys.stderr)
+        return exe
+    if check:
+        return None
+    _error_exit(f"required executable not found: '{name}'")
+
+
+# returns (make, gmake)
+def _find_make() -> tuple[str, str]:
+    make = _find_exe('make')
+    cmd = [make, '--version']
+    res = subprocess.run(
+        cmd, check=False, universal_newlines=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if res.returncode == 0 and re.match('GNU\s[Mm]ake\s', res.stdout.strip()):
+        return make, make
+    gmake = _find_exe('gmake')
+    return make, gmake
+
+
+def _prefix_path(*dirs: str) -> Union[str, None]:
+    prev_path = os.environ['PATH']
+    path_dirs = list(dirs)
+    for d in prev_path.split(':'):
+        if d and os.path.isdir(d) and d not in path_dirs:
+            path_dirs.append(d)
+    new_path = ':'.join(path_dirs)
+    if new_path != prev_path:
+        os.environ['PATH'] = new_path
+        print(f"$PATH changed to '{new_path}'", file=LOG_OUT)
+        return prev_path
+    return None
+
+
+def _restore_path(prev_path: str) -> None:
+    if prev_path:
+        os.environ['PATH'] = prev_path
+        print(f"$PATH reset to '{prev_path}'", file=LOG_OUT)
+
+
+def _show_file(path: str, desc: str) -> None:
+    msg = desc + ': ' + path
+    print(msg)
+    if LOG_OUT != sys.stdout:
+        print(msg, file=LOG_OUT)
+    if platform.system() == 'Darwin':
+        _exe_run(['/usr/bin/open', path])
+
+
+def _read_file(path: str) -> str:
+    with open(path, 'rt', encoding='latin_1', errors='ignore') as fd:
+        return fd.read()
+
+
+def _write_file(path: str,
+                content: Union[str, None] = None,
+                mode: Union[int, None] = None) -> int:
+    with open(path, 'wt', encoding='latin_1', errors='ignore') as fd:
+        if mode:
+            os.chmod(path, mode)
+        if content:
+            return fd.write(content)
+    return 0
+
+
+# ========================================================================
+# Text
+# ========================================================================
+
+BANNER: str = '=' * 40
+
+RELOCATE = '''#!/bin/bash -e
+cd "$(dirname "$0")"
+here="$(pwd)"
+
+"$here/lib/erlang/Install" -minimal "$here/lib/erlang" >/dev/null
 
 # Make sure it works
-./erl -noshell -eval 'erlang:halt(0).'
-EOF
-chmod 0755 relocate_here
+PATH="$here/bin:$PATH"
+bin/rebar* --version
 
-cat <<EOF > activate
-#!/usr/bin/false
+@@SED@@ -E "s!@@HERE@@!${here}!g" "$here/activate.in" > "$here/activate"
+/bin/chmod 0644 "$here/activate"
+'''
 
-_activate_dir="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+ACTIVATE = '''#!/usr/bin/false
+_activate_dir="@@HERE@@"
 
 otp_deactivate 2>/dev/null || true
-[[ -z "\$_ACTIVE_OTP_PATH" ]] || PATH="\${PATH//\${_ACTIVE_OTP_PATH}:/}"
-_ACTIVE_OTP_PATH="\$_activate_dir/bin"
-PATH="\${_ACTIVE_OTP_PATH}:\${PATH//\${_ACTIVE_OTP_PATH}:/}"
+[[ -z "$_ACTIVE_OTP_PATH" ]] || PATH="${PATH//${_ACTIVE_OTP_PATH}:/}"
+_ACTIVE_OTP_PATH="$_activate_dir/bin"
+PATH="${_ACTIVE_OTP_PATH}:${PATH//${_ACTIVE_OTP_PATH}:/}"
 export  PATH _ACTIVE_OTP_PATH
 
 otp_deactivate()
 {
-    if [[ -n "\$_ACTIVE_OTP_PATH" ]]
+    if [[ -n "$_ACTIVE_OTP_PATH" ]]
     then
-        export  PATH="\${PATH//\${_ACTIVE_OTP_PATH}:/}"
+        export  PATH="${PATH//${_ACTIVE_OTP_PATH}:/}"
         unset   _ACTIVE_OTP_PATH
         hash -r 2>/dev/null || true
     fi
@@ -455,48 +1532,204 @@ otp_deactivate()
 
 unset   _activate_dir
 hash -r 2>/dev/null || true
-EOF
-chmod 0644 activate
+'''
 
-run cd ..
-run tar czf "${otp_dir}.tgz" "otp-${otp_rel}"
 
-#
-# Now we can test OTP and Rebar
-#
-if $run_tests
-then
-    run cd "$ERL_TOP"
+# ========================================================================
+# Logging
+# ========================================================================
+# See https://stackoverflow.com/questions/19425736/ in its entirety for
+# background, but don't believe everything it says, especially regarding
+# redirecting output from subprocess.run/Popen.
 
-    path="$PATH"
-    export  PATH="$ERL_TOP/bin:$path"
-    hash -r 2>/dev/null || true
-    run $MAKE release_tests
-    run cd release/tests/test_server
-    run "$ERL_TOP/bin/erl" -s ts install -s ts smoke_test batch -s init stop
-    export  PATH="$path"
-    hash -r 2>/dev/null || true
-    unset   path
+def _dbg_cfg(conf: Config, heading: str) -> None:
+    if DEBUG:
+        for line in _banner_text(conf, heading=heading).split('\n'):
+            logging.debug(line)
 
-    chmod -R +r .
-    run tar czf "${otp_dir}-smoke-tests.tgz" .
-    $open_html index.html
 
-    run cd "$repos/rebar3"
-    . "$otp_dir/activate"
+def _dbg_env(heading: str) -> None:
+    if DEBUG:
+        lines = ['  ' + s for s in
+                 sorted(_exe_cap(['/usr/bin/env']).split('\n'))]
+        for line in _banner_text(lines, heading=heading).split('\n'):
+            logging.debug(line)
 
-    REBAR3="$otp_dir/bin/rebar3"
-    REBAR="$REBAR3"
-    export  REBAR REBAR3
 
-    run "$REBAR3" ct
-    run cd _build/test/logs
-    run tar czf "${otp_dir}-rebar-tests.tgz" .
-    $open_html index.html
-fi
+class _LogStream(io.TextIOBase):
+    """
+    Drop-in replacement for sys.stdout/stderr that redirects output to the
+    root logger.
+    """
 
-cd "$pwd"
-$keep_bld || run /bin/rm -rf "$repos"
-echo
-echo done.
-echo
+    def __init__(self, log_func):
+        self._log_func = log_func
+        # Experimentation shows that there's no viable way to cause buf to be
+        # a growable, reusable memory buffer, so it's most efficient to just
+        # make it a simple str.
+        # In particular, io.StringIO offers no benefit.
+        self._buf: str = ''
+        # Not actually used in this class, but this is the max size that will
+        # be sent to self.write() by the _LogPipe subclass, so keep the chunks
+        # manageable for how we handle the string buffer.
+        self._bsz: int = 512
+
+    def write(self, msg: str):
+        # We'll always return len(msg), regardless of what we do with the data
+        if ret := len(msg):
+            if (nl := msg.find('\n')) < 0:
+                self._buf += msg
+                return ret
+            # we have at least one newline
+            log = self._log_func
+            seg = msg[:nl]
+            if buf := self._buf:
+                # flush the buffer along with remainder of the 1st line
+                seg = buf + seg
+                self._buf = ''
+            # buf is empty, seg is a line to be logged
+            log(seg)
+            rem = msg[(nl + 1):]
+            while rem:
+                # still have characters to consume
+                if (nl := rem.find('\n')) < 0:
+                    # no more newlines, buffer the rest
+                    self._buf = rem
+                    return ret
+                log(rem[:nl])
+                rem = rem[(nl + 1):]
+        return ret
+
+    def flush(self):
+        if buf := self._buf:
+            self._log_func(buf)
+            self._buf = ''
+
+
+class LogOut(_LogStream):
+    def __init__(self):
+        _LogStream.__init__(self, logging.info)
+        self.name = 'LogOut'
+
+
+class LogErr(_LogStream):
+    def __init__(self):
+        _LogStream.__init__(self, logging.error)
+        self.name = 'LogErr'
+
+
+class _LogPipe(_LogStream, threading.Thread):
+    """
+    Async thread to consume and redirect output from subprocesses to
+    the root logger.
+    For clarity, while an instance of this class can be passed to multiple
+    subprocesses in sequence, an instance must never be connected to multiple
+    subprocesses executing in parallel!
+    """
+
+    def __init__(self, name, log_func):
+        _LogStream.__init__(self, log_func)
+        threading.Thread.__init__(self, name=name, daemon=True)
+        rfd, wfd = os.pipe()
+        os.set_inheritable(wfd, True)
+        self._wfd = wfd
+        # The pipe is already a fifo queue somewhere, and we want RawIOBase's
+        # single-call read/readinto semantics to get output to the logger
+        # promptly so the timestamps reflect reality.
+        # We accurately type the reader here, despite what the editor thinks.
+        self._reader: io.RawIOBase = os.fdopen(rfd, mode='rb', buffering=0)
+
+    def close(self):
+        if wfd := self._wfd:
+            os.close(wfd)
+            self._wfd = -1
+        self.flush()
+
+    def fileno(self):
+        return self._wfd
+
+    def run(self):
+        buf = bytearray(self._bsz)
+        reader = self._reader
+        while cnt := reader.readinto(buf):
+            # we NEVER want an exception here, so just swallow whatever arrives
+            self.write(str(buf[:cnt], encoding='latin_1', errors='ignore'))
+            # self.write(buf[:cnt].decode())
+        # cnt == 0 => EOF, meaning the pipe's write fd has been closed
+        reader.close()
+
+
+class PipeOut(_LogPipe):
+    def __init__(self):
+        _LogPipe.__init__(self, 'LogPipeOut', logging.info)
+
+
+class PipeErr(_LogPipe):
+    def __init__(self):
+        _LogPipe.__init__(self, 'LogPipeErr', logging.error)
+
+
+def _start_log(log_file: str) -> None:
+    global _log_file, _pipe_out, _pipe_err, LOG_OUT, LOG_ERR
+    level = logging.DEBUG if DEBUG else logging.INFO
+    logging.basicConfig(
+        filename=log_file, filemode='wt',
+        encoding='latin_1', errors='ignore',
+        format='%(asctime)s %(levelname)-7s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        level=level
+    )
+    log_out = LogOut()
+    log_err = LogErr()
+    pipe_out = PipeOut()
+    pipe_err = PipeErr()
+    pipe_out.start()
+    pipe_err.start()
+    _log_file = log_file
+    _pipe_out = pipe_out
+    _pipe_err = pipe_err
+    LOG_OUT = log_out
+    LOG_ERR = log_err
+    atexit.register(_stop_log)
+
+
+def _stop_log():
+    global _log_file, _pipe_out, _pipe_err, LOG_OUT, LOG_ERR
+    _log_file = None
+    if _pipe_out:
+        _pipe_out.close()
+        _pipe_out = None
+    if _pipe_err:
+        _pipe_err.close()
+        _pipe_err = None
+    if LOG_OUT != sys.stdout:
+        LOG_OUT.flush()
+        LOG_OUT = sys.stdout
+    if LOG_ERR != sys.stderr:
+        LOG_ERR.flush()
+        LOG_ERR = sys.stderr
+    atexit.unregister(_stop_log)
+
+
+# _log_file also operates as a semaphore for whether logging is hooked up
+_log_file: Union[str, None] = None
+_pipe_out: Union[_LogPipe, None] = None
+_pipe_err: Union[_LogPipe, None] = None
+
+# Do everything in ISO-8859-1 and ignore any encode/decode errors
+# They're io.TextIOWrapper despite what the editor thinks.
+sys.stdout.reconfigure(encoding='latin_1', errors='ignore')
+sys.stderr.reconfigure(encoding='latin_1', errors='ignore')
+
+# These really are io.TextIOBase in all cases, but when accurately typed they
+# cause editor warnings here and where they're used.
+LOG_OUT = sys.stdout
+LOG_ERR = sys.stderr
+
+# ========================================================================
+# Run the program
+# ========================================================================
+
+DEBUG: bool = True
+
+Main().run()
