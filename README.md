@@ -26,6 +26,61 @@ about everything on `arm64` Macs these days.
 Some day I'll probably dust off an `x86_64` machine and give the older versions a spin, but that's
 a pretty low priority.
 
+## Supported Platforms
+
+OTP releases 25+ _should_ build and run fine with any of the available options, though note that I've as yet to get a build with `wxWidgets` to complete on `FreeBSD`.
+
+Below that things get dicey, particularly with `wxWidgets`, so YMMV.
+As you go back to older releases, modern compilers become increasingly cranky about code conformance.
+Some of this can probably be addressed by telling compilers to use older code standards, and I've tinkered with that a bit, but it's not a priority for me.
+There *MAY* be benefit in using older `autoconf` versions, but I haven't played with that yet.
+
+The OTP `wx` application was rewritten in OTP-24, and I haven't come up with a working version on any platform - working `wx` applications have been produced on various platforms for OTP before and after 24, but none so far on 24 itself.
+
+Below OTP-17, OpenSSL isn't compatible with `arm64` on anything but `Linux`, but these configurations are largely unexplored.
+
+### General Platform Status
+
+| OS | CPU | Status |
+|:---|:----|:-------|
+| `macOS` | `arm64`  | OTP-21+, some without `wxWidgets` |
+| `macOS` | `x64_64` | _as above_ |
+| `Linux` | `arm64` | _as above_ |
+| `Linux` | `x64_64` | _as above_ |
+| `FreeBSD` | `arm64` | OTP-22+ without `wxWidgets` |
+| `FreeBSD` | `x64_64` | untested |
+| `*BSD` | `*` | untested, _should_ be similar to `FreeBSD` |
+
+### Release & Platform Deets
+
+The following is as much for my own reference as yours.
+
+#### Quirks
+
+| Package | Release | Predicate | What |
+|:--------|:--------|:----------|:-----|
+| OTP | \< 22 | `FreeBSD` | `configure` can't find required `config.*` files |
+| OTP | 19,20 | `macOS >= 10.5` | `configure` broken OS version check |
+| OTP | 24 | `macOS` with `wx` | undefined NIF symbols |
+| OTP | \< 21 | without `wx` | can't build documentation |
+| OpenSSL | 1.0 | `{*BSD,macOS}-arm64` | unsupported configuration |
+| wxWidgets | 3.1 | `FreeBSD` | `langinfo.h` doesn't set `_NL_...` macros \* |
+
+> \* The script patches `wxWidgets/src/unix/uilocale.cpp` to not use `langinfo.h` in this specific case.
+
+#### Language Conformance
+
+| Package | Release | C Std | C++ Std |
+|:--------|:--------|:------|:--------|
+| OTP | \< 21 | c99 | c++03 |
+| OTP | 21+ | c11 | c++11 |
+| OpenSSL | 1.0 | c90? | n/a |
+| OpenSSL | 1.1 | c99? | n/a |
+| OpenSSL | 3.0 | c11? | n/a |
+| wxWidgets | 3.0 | gnu99 | gnu++11 |
+| wxWidgets | 3.1 | gnu11 | gnu++11 |
+
+
 ## Why Not Kerl?
 
 [kerl][Kerl] _was_ around when I started tinkering with the ancestors of this script, and I did use

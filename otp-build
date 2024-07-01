@@ -121,14 +121,32 @@ import urllib.request
 from typing import Any, Callable, NoReturn, Union
 
 # ========================================================================
-# Main program
+# Types
 # ========================================================================
+# A few common types to maintain sanity (and editor type-checking).
 
 Exe = str
-CompilerFamily = Union['gcc', 'clang']
+Info = str
+
+# Common ordered version representation
 Vsn = tuple[int, ...]
-Compiler = tuple[CompilerFamily, Vsn, Exe, Exe]
-Config = dict[str, Union[bool, int, str, tuple[int, ...], Compiler, None]]
+
+# Active C and C++ compiler(s)
+CcExe = str
+CxxExe = str
+CompilerFamily = Union['clang', 'gcc', 'intel', 'unknown']
+Compiler = tuple[CompilerFamily, Vsn, CcExe, CxxExe]
+
+# The active configuration, i.e. the current state
+Config = dict[str, Union[bool, int, str, Vsn, Compiler, None]]
+
+# function returning tuple(ok, why)
+CheckSupportedResult = tuple[bool, Info]
+CheckSupportedFunction = Callable[[Config], CheckSupportedResult]
+
+# ========================================================================
+# Main program
+# ========================================================================
 
 class Main():
 
@@ -136,6 +154,7 @@ class Main():
         rundir = os.getcwd()
         parser = self._parser()
         conf = parser.parse_args(sys.argv[1:]).__dict__
+        Main._dump = conf['dump']
         # Validate/fixup the config
         rel = conf['rel']
         if rel < MIN_REL or rel > MAX_REL:
@@ -153,19 +172,28 @@ class Main():
             out = rundir
         conf['out'] = out
         if inst := conf['inst']:
-            inst = _ensure_dir(inst)
+            conf['inst'] = _ensure_dir(inst)
         if not (log := conf['log']):
             log = os.path.join(out, 'log')
         conf['log'] = log = _ensure_dir(log)
         self._platform_setup(conf)
-        self._find_exes(conf)
-        for f in _platform_check:
+        errs = []
+        for f in self._platform_check:
             ok, info = f(conf)
             if not ok:
-                msg = f"OTP-{rel} is not supported on this platform: {info}"
-                _error_exit(msg)
+                errs.append(info)
+        if errs:
+            msg = 'Unsupported build configuration:'
+            if len(errs) > 1:
+                delim = '\n    '
+                msg += delim + delim.join(errs)
+            else:
+                msg += ' ' + errs[0]
+            _error_exit(msg)
+        self._find_exes(conf)
         conf_text = self._config_block(conf)
         if conf['doit'] or self._confirm(conf_text):
+            Main._quiet = False
             bld_log_name = f"otp-{conf['rel']}-build.log"
             bld_log_path = os.path.join(log, bld_log_name)
             _start_log(bld_log_path)
@@ -210,10 +238,10 @@ class Main():
         systype = os_type + '-' + os_arch
         if os_type == 'Darwin':
             if conf['os_arch'] == 'x86_64':
-                # account for hyperthreading
+                # On x86 Macs account for hyperthreading, lest we bring the
+                # interactive environment to its knees.
                 os_cpus /= 2
-            mac_vsn = _exe_cap(['/usr/bin/sw_vers', '-productVersion'])
-            mac_vsn = tuple(int(s) for s in mac_vsn.split('.'))
+            mac_vsn = conf['mac_vsn']
             if mac_vsn[0] < 11:
                 min_vsn = '10.9'
             else:
@@ -230,7 +258,7 @@ class Main():
         Main._reset_bldenv(conf)
         # Clear any environment variables that MAY lead a process to believe
         # it's running somewhere that ASCII escape codes are recognized.
-        patt = re.compile(r'^(COLOR|ITERM_|LC_|TERM)')
+        patt = re.compile(r'^(COLOR|ITERM_|LC_|LS_|TERM)')
         remove = []
         for key in os.environ.keys():
             if patt.match(key):
@@ -273,9 +301,12 @@ class Main():
 
     @staticmethod
     def _config_block(conf: Config) -> str:
-        lines = (
+        cfam, cvsn, cc, cxx = conf['compiler']
+        compiler = f"{cfam.capitalize()} {_vsn_to_version(cvsn)}"
+        lines = [
             'Effective Configuration:\n',
             f"  OTP release:                {conf['rel']}",
+            f"  Compiler:                   {compiler}",
             f"  Working directory:          {conf['work']}",
             f"  Keep working directory:     {conf['keep']}",
             f"  Archive output directory:   {conf['out']}",
@@ -286,44 +317,51 @@ class Main():
             f"  With jinterface:            {conf['java']}",
             f"  Optimize for this CPU:      {conf['native']}",
             f"  Use lots of CPUs to build:  {conf['fast']}",
-            f"  Run all tests:              {conf['test']}",
-            f"  Compiler:                   {conf['compiler']}",
-            f"  Git:                        {conf['git']}",
-            f"  GNU make:                   {conf['gmake']}",
-            f"  System make:                {conf['make']}",
-            f"  Perl:                       {conf['perl']}",
-            f"  Sed:                        {conf['sed']}",
-            f"  Tar:                        {conf['tar']}",
-            f"  Run without confirmation:   {conf['doit']}"
-        )
+            f"  Run tests:                  {conf['test']}",
+        ]
+        if Main._dump:
+            lines += [
+                f"  C Compiler:                 {cc}",
+                f"  C++ Compiler:               {cxx}",
+                f"  Git:                        {conf['git']}",
+                f"  GNU make:                   {conf['gmake']}",
+                f"  System make:                {conf['make']}",
+                f"  Perl:                       {conf['perl']}",
+                f"  Sed:                        {conf['sed']}",
+                f"  Tar:                        {conf['tar']}"
+            ]
+        lines.append(f"  Run without confirmation:   {conf['doit']}")
         return '\n'.join(lines)
 
     @staticmethod
     def _find_exes(conf: Config) -> None:
-        git = _find_exe('git')
-        perl = _find_exe('perl')
-        sed = _find_exe('sed')
-        tar = _find_exe('tar')
+        git   = _find_exe('git')
+        perl  = _find_exe('perl')
+        sed   = _find_exe('sed')
+        tar   = _find_exe('tar')
         make, gmake = _find_make()
         conf['compiler'] = _find_compiler(conf)
-        conf['git'] = git
+        conf['git']   = git
         conf['gmake'] = gmake
-        conf['make'] = make
-        conf['perl'] = perl
-        conf['sed'] = sed
-        conf['tar'] = tar
+        conf['make']  = make
+        conf['perl']  = perl
+        conf['sed']   = sed
+        conf['tar']   = tar
 
     @staticmethod
     def _platform_setup(conf: Config) -> None:
         os_arch = platform.machine()
         os_cpus = os.cpu_count()
         os_type = platform.system()
-        os_vsn = platform.release()
-        os_vsn = tuple(int(s) for s in os_vsn.split('.') if s.isdecimal())
+        os_vsn  = _version_to_vsn(platform.release().partition('-')[0])
         conf['os_arch'] = os_arch
         conf['os_cpus'] = os_cpus
         conf['os_type'] = os_type
-        conf['os_vsn'] = os_vsn
+        conf['os_vsn']  = os_vsn
+        conf['systype'] = os_type + '-' + os_arch
+        if os_type == 'Darwin':
+            mac_vsn = _exe_cap(['/usr/bin/sw_vers', '-productVersion'])
+            conf['mac_vsn'] = _version_to_vsn(mac_vsn)
 
     @staticmethod
     def _reset_bldenv(conf: Config) -> None:
@@ -441,23 +479,33 @@ class Main():
             help="""
                 Accept the calculated build configuration without confirmation.
                 NOT recommended!""")
+        parser.add_argument(
+            '--dump', action='store_true',
+            help="""
+                Dump the environment and internal state to the build log.
+                This is a debugging/development option and should NOT be used
+                in normal operation, especially if your environment contains
+                sensitive information.""")
+        parser.add_argument(
+            '--verbose', action='store_true',
+            help="Run the OTP build steps in verbose mode.")
         return parser
 
-    # Environment variables that MAY interfere with building.
+    # Environment variables that MAY affect build behavior.
     # Each build operation may manipulate these.
     # CC and CXX are directly reset before each build phase.
     _clear_evars = (
         'AR', 'ARFLAGS', 'AS', 'ASFLAGS',
         'CFLAGS', 'CXXFLAGS', 'CPP', 'CPPFLAGS', 'CPPDEFINES', 'CPPINCLUDES',
-        'LD', 'LDFLAGS', 'LDLIBS', 'MAKE', 'MAKEFLAGS', 'RANLIB', 'RM'
+        'LD', 'LDFLAGS', 'LDLIBS', 'MAKE', 'MAKEFLAGS', 'RANLIB', 'RM', 'V'
     )
 
+    _dump : bool = False
 
-# function returning tuple(ok, why)
-SupportedFunResult = tuple[bool, str]
-SupportedFunction = Callable[[Config], SupportedFunResult]
-_platform_check: list[SupportedFunction] = []
+    # Start (and maybe stop) quietly
+    _quiet: bool = True
 
+    _platform_check: list[CheckSupportedFunction] = []
 
 # ========================================================================
 # Subordinate classes
@@ -498,7 +546,7 @@ class Repo(abc.ABC):
 
     def vsn_ints(self) -> tuple[int, ...]:
         if not (vsn := self._vsn_ints):
-            vsn = tuple(int(s) for s in self.version().split('.'))
+            vsn = _version_to_vsn(self.version())
             self._vsn_ints = vsn
         return vsn
 
@@ -558,18 +606,17 @@ class Repo(abc.ABC):
     def _git_run(self, cmd: list[str]) -> None:
         _exe_run([self.__git_exe, '-C', self._path] + cmd)
 
-
 class OTPRepo(Repo):
 
     def build(self, conf: Config) -> None:
         docs = conf['docs']
         inst = conf['inst']
-        rel = conf['rel']
+        rel  = conf['rel']
         test = conf['test']
         work = conf['work']
-        wx = conf['wx']
-        vsn = self.version()
-        bld = self.path()
+        wx   = conf['wx']
+        vsn  = self.version()
+        bld  = self.path()
         if not inst:
             inst = os.path.join(work, 'otp-inst-' + vsn)
             conf['inst'] = inst
@@ -599,73 +646,26 @@ class OTPRepo(Repo):
             elif rel >= 27:
                 ex_doc_path = self._setup_exdoc(conf)
                 envpath = _prefix_path(ex_doc_path)
-        # Notable release changes
-        # 22? parallel compile added - don't use make -jN
-        # 19  --enable-darwin-64bit removed from docs
-        # 2?  --enable-m64-build breaks
-        # 23  --enable-pie added
-        # 23  docs DOC_TARGETS added
-        # 24  HiPE removed
-        # 27  docs build switched from fop to ex_doc
-        # ??  ODBC compilable
-        cflags = '-O3 -g0 -w'
-        ldflags = '-O3 -g0'
-        # Use getcwd() to mimic what scripts get from `pwd -P`
-        erl_top = os.getcwd()
-        os_arch = conf['os_arch']
-        os_type = conf['os_type']
-        darwin = os_type == 'Darwin'
-        # linux   = os_type == 'Linux'
-        cmd = ['./configure', '--prefix=' + inst]
-        # if rel < 19 and darwin and os_arch == 'x86_64':
-        #     cmd.append('--enable-darwin-64bit')
-        # elif rel < 28:
-        #     cmd.append('--enable-m64-build')
-        if darwin:
-            cmd.append('--enable-darwin-64bit')
-        elif os_arch == 'x86_64':
-            cmd.append('--enable-m64-build')
-        # if rel >= 23 :
-        #     cmd.append('--enable-pie')
-        cmd.append('--with-ssl=' + conf['openssl_inst'])
-        cmd.append('--disable-dynamic-ssl-lib')
-        # Allow HiPE to be built to satisfy some Rebar versions' dependencies
-        # if os.path.isdir('lib/hipe') :
-        #     cmd.append('--disable-hipe')
-        #     cmd.append('--without-hipe')
-        if not test and not os.path.isdir('lib/otp_mibs'):
-            cmd.append('--without-snmp')
-        if conf['java']:
-            cmd.append('--with-javac')
-            cmd.append('--with-jinterface')
-        else:
-            cmd.append('--without-javac')
-            cmd.append('--without-jinterface')
         if wx:
-            cmd.append('--with-wx')
-            # may make a difference on some versions/platforms?
-            cmd.append('--with-wx-config=' + wx)
             prevpath = _prefix_path(os.path.dirname(wx))
             if not envpath:
                 envpath = prevpath
-        else:
-            cmd.append('--without-wx')
-            cmd.append('--without-debugger')
-            cmd.append('--without-et')
-            cmd.append('--without-observer')
-        if darwin:
-            min_vsn = conf['mac_min_vsn']
-            # OTP-20 tells us to set this, by then ignores it :(
-            os.environ['MACOSX_DEPLOYMENT_TARGET'] = min_vsn
-            vsn_flag = ' -mmacosx-version-min=' + min_vsn
-            cflags += vsn_flag
-            ldflags += vsn_flag
-        if conf['native']:
-            cflags += ' -march=native -mtune=native'
-        # os.environ['CFLAGS'] = cflags
-        # os.environ['CXXFLAGS'] = cflags
-        # os.environ['LDFLAGS'] = ldflags
+        # Notable release changes
+        # 22? parallel compile added - don't use make -jN
+        # 23  docs DOC_TARGETS added
+        # 27  docs build switched from fop to ex_doc
+        cflags, cxflags, ldflags = self._compiler_flags(conf)
+        cfgflags = self._configure_flags(conf)
+        # Use getcwd() to mimic what scripts get from `pwd -P`
+        erl_top = os.getcwd()
+        cmd = ['./configure', '--prefix=' + inst] + cfgflags
+        os.environ['CFLAGS'] = cflags
+        os.environ['CXXFLAGS'] = cxflags
+        # ToDo: Conditional on ??? - causes link failure
+        os.environ['LDFLAGS'] = ldflags
         os.environ['ERL_TOP'] = erl_top
+        if conf['verbose']:
+            os.environ['V'] = '1'
         _exe_run(cmd)
         make = conf['gmake']
         makej = [make]
@@ -818,6 +818,75 @@ class OTPRepo(Repo):
         return tar_files
 
     @staticmethod
+    def _compiler_flags(conf: Config) -> tuple[str, str, str]:
+        cflags  = '-O3 -g0 -w'
+        if conf['native']:
+            cflags += ' -march=native -mtune=native'
+        cxflags = cflags
+        ldflags = '-O3 -g0'
+        rel     = conf['rel']
+        if rel > 21:
+            cflags  += ' -std=gnu17'
+            cxflags += ' -std=gnu++17'
+        elif rel > 16:
+            cflags  += ' -std=gnu11'
+            cxflags += ' -std=gnu++11'
+        else:
+            cflags  += ' -std=gnu99'
+            cxflags += ' -std=gnu++03'
+        if conf['os_type'] == 'Darwin':
+            vsn_flag = ' -mmacosx-version-min=' + conf['mac_min_vsn']
+            cflags  += vsn_flag
+            cxflags += vsn_flag
+            ldflags += vsn_flag
+        return cflags, cxflags, ldflags
+
+    @staticmethod
+    def _configure_flags(conf: Config) -> list[str]:
+        rel     = conf['rel']
+        darwin  = conf['os_type'] == 'Darwin'
+        cfg     = []
+        # Notable release changes
+        # 19  --enable-darwin-64bit removed
+        # 19,20  configure broken on OSX >= 10.5
+        # 23  --enable-pie added
+        # 24  HiPE removed
+        # ??  ODBC compilable
+        if rel < 19 and darwin:
+            cfg.append('--enable-darwin-64bit')
+        elif conf['os_arch'] == 'x86_64':
+            cfg.append('--enable-m64-build')
+        # if rel >= 23 :
+        #     cfg.append('--enable-pie')
+        cfg.append('--with-ssl=' + conf['openssl_inst'])
+        cfg.append('--disable-dynamic-ssl-lib')
+        # Allow HiPE to be built to satisfy some Rebar versions' dependencies
+        # if os.path.isdir('lib/hipe') :
+        #     cfg.append('--disable-hipe')
+        #     cfg.append('--without-hipe')
+        if not conf['test'] and not os.path.isdir('lib/otp_mibs'):
+            cfg.append('--without-snmp')
+        if conf['java']:
+            cfg.append('--with-javac')
+            cfg.append('--with-jinterface')
+        else:
+            cfg.append('--without-javac')
+            cfg.append('--without-jinterface')
+        if wx := conf['wx']:
+            cfg.append('--with-wx')
+            # may make a difference on some versions/platforms?
+            cfg.append('--with-wx-config=' + wx)
+        else:
+            cfg.append('--without-wx')
+            cfg.append('--without-debugger')
+            cfg.append('--without-et')
+            cfg.append('--without-observer')
+        # if darwin:
+        #     # OTP-20 tells us to set this, but then ignores it :(
+        #     os.environ['MACOSX_DEPLOYMENT_TARGET'] = conf['mac_min_vsn']
+        return cfg
+
+    @staticmethod
     def _setup_exdoc(conf: Config) -> str:
         rel = conf['rel']
         work = conf['work']
@@ -864,22 +933,34 @@ class OTPRepo(Repo):
 
     _label: str = 'OTP'
 
+    @staticmethod
+    def _check_supported(conf: Config) -> CheckSupportedResult:
+        os_type = conf['os_type']
+        os_arch = conf['os_arch']
+        systype = conf['systype']
+        rel     = conf['rel']
+        if os_type == 'Darwin':
+            if rel in (19, 20) and (mac_vsn := conf['mac_vsn']) >= (10, 5):
+                # 19,20  configure broken on OSX >= 10.5
+                vstr = _vsn_to_version(mac_vsn)
+                why = f"OTP-{rel} macOS-{vstr} configure broken"
+                return False, why
+            if rel == 24 and conf['wx'] and os_arch == 'arm64':
+                # MAY apply to x86 as well, need confirmation
+                why = f"OTP-{rel} {systype} wx application linking broken"
+                return False, why
+        if rel < 21 and conf['docs'] and not conf['wx']:
+            why = "OTP < 21 can't build documentation without wx application"
+            return False, why
+        # if rel < 17 and os_arch == 'x86_64':
+        #     # x86_64 - drivers/common/inet_drv.c doesn't compile
+        #     # SHOULD just require proper language standard so not forced
+        #     # until confirmed
+        #     why = f"OTP-{rel} {os_arch} drivers/common/inet_drv.c broken"
+        #     return False, why
+        return True, systype
 
-def _otp_supported(conf: Config) -> SupportedFunResult:
-    os_type = conf['os_type']
-    os_arch = conf['os_arch']
-    systype = f"{os_type}-{os_arch}"
-    label = f"{OTPRepo._label}-{systype}"
-    if conf['rel'] >= 17:
-        return True, label
-    if os_arch == 'x86_64':
-        # x86_64 - drivers/common/inet_drv.c doesn't compile
-        return False, label
-    return True, label
-
-
-_platform_check.append(_otp_supported)
-
+Main._platform_check.append(OTPRepo._check_supported)
 
 class OpenSSLRepo(Repo):
 
@@ -1040,23 +1121,19 @@ class OpenSSLRepo(Repo):
             return 'OpenSSL_1_1_1-stable'
         return 'openssl-3.0'
 
+    @staticmethod
+    def _check_supported(conf: Config) -> CheckSupportedResult:
+        os_type = conf['os_type']
+        os_arch = conf['os_arch']
+        systype = conf['systype']
+        rel     = conf['rel']
+        if rel < 17 and not (os_arch == 'x86_64' or os_type == 'Linux'):
+            return False, f"{OpenSSLRepo._label} < 1.1 {systype} unsupported"
+        return True, f"{OpenSSLRepo._label}-{systype}"
+
     _label: str = 'OpenSSL'
 
-
-def _openssl_supported(conf: Config) -> SupportedFunResult:
-    os_type = conf['os_type']
-    os_arch = conf['os_arch']
-    systype = f"{os_type}-{os_arch}"
-    label = f"{OpenSSLRepo._label}-{systype}"
-    if conf['rel'] >= 17 or os_arch == 'x86_64':
-        return True, label
-    if os_type != 'Linux':
-        return False, label
-    return True, label
-
-
-_platform_check.append(_openssl_supported)
-
+Main._platform_check.append(OpenSSLRepo._check_supported)
 
 class RebarRepo(Repo):
 
@@ -1121,33 +1198,59 @@ class RebarRepo(Repo):
 
     _label: str = 'Rebar'
 
-
 class WxRepo(Repo):
 
     def build(self, conf: Config) -> None:
         work = conf['work']
-        rel = conf['rel']
-        vsn = self.version()
-        bld = os.path.join(work, 'wx-build-' + vsn)
-        inst = os.path.join(work, 'wx-inst-' + vsn)
+        vsn  = self.version()
+        bld  = os.path.join(work, 'wx-build-' + vsn)
+        inst  = os.path.join(work, 'wx-inst-' + vsn)
         name = self.label() + ' ' + vsn
-        vsn = self.vsn_ints()
+        vsn  = self.vsn_ints()
         # build config
         cfg = [os.path.join(self.path(), 'configure'),
                f"--prefix={inst}", '--disable-shared']
+        cflags  = '-std=c99'
+        cxflags = ''
+        os_type = conf['os_type']
+        darwin  = os_type == 'Darwin'
+        anybsd  = os_type.endswith('BSD')
+        rel     = conf['rel']
         if rel >= 24:
             cfg.append('--enable-webview')
-        # elif vsn >= (3, 1) :
-        # Do NOT use the --enable-compat28 flag for OTP
-        # Causes "error: call to member function 'AddTool' is ambiguous"
-        # cfg.append('--enable-compat28')
-        if conf['os_type'] == 'Darwin':
+        elif anybsd:
+            cfg.append('--disable-webview')
+        if vsn >= (3, 2):
+            # Do NOT use the --enable-compat28 flag for OTP
+            # Causes "error: call to member function 'AddTool' is ambiguous"
+            cfg.append('--enable-compat30')
+            cfg.append('--with-cxx=14')
+        elif vsn >= (3, 1):
+            cfg.append('--with-cxx=11')
+        else:
+            cxflags = '-std=c++11'
+        if darwin:
             cfg.append('--with-cocoa')
             cfg.append('--with-macosx-version-min=' + conf['mac_min_vsn'])
         else:
             cfg.append('--with-gtk')
-            os.environ['CFLAGS'] = '-fPIC'
-            os.environ['CXXFLAGS'] = '-fPIC'
+            cflags += ' -fPIC'
+            cxflags += ' -fPIC'
+        if anybsd:
+            cfg.append('--disable-epollloop')
+            if vsn >= (3, 1) and vsn < (3, 2):
+                # *BSD langinfo.h doesn't set _NL_... macros
+                # Mucking about with the --disable-intl and related switches
+                # just breaks more stuff, so comment out the check for the
+                # include file itself.
+                # Note that newline substitution is NOT standard across seds.
+                # Just remember this is OS ERE, not PCRE.
+                _exe_run([
+                    '/usr/bin/sed', '-Ei.orig', '-e',
+                    r's/^ *(#include <locale.h>) *$/\1\n#undef HAVE_LANGINFO_H/',
+                    os.path.join(self.path(), 'src', 'unix', 'uilocale.cpp') ])
+                    # r's/^ *(check_include_file\(langinfo\.h +HAVE_LANGINFO_H\).*)$/# \1/',
+                    # os.path.join(self.path(), 'build', 'cmake', 'setup.cmake') ])
         if self._build_check(conf, cfg):
             show = 'Reusing previously built ' + name
             print(show)
@@ -1160,18 +1263,23 @@ class WxRepo(Repo):
             print(show)
             _banner(f"{show}\nIn '{bld}'")
             _ch_dir(bld)
+            if cflags := cflags.strip():
+                os.environ['CFLAGS'] = cflags
+            if cxflags := cxflags.strip():
+                os.environ['CXXFLAGS'] = cxflags
             _exe_run(cfg)
-            make = [conf['make'], ]
+            cmd = [conf['gmake']]
             if jflag := conf['make_jflag']:
-                make.append(jflag)
+                cmd.append(jflag)
             show = 'Building ' + name + ' ...'
             print(show)
             _banner(f"{show}\nIn '{bld}'")
-            _exe_run(make)
+            _exe_run(cmd)
             show = 'Installing ' + name + ' ...'
             print(show)
             _banner(f"{show}\nTo '{inst}'")
-            _exe_run(make + ['install'])
+            cmd.append('install')
+            _exe_run(cmd)
             self._build_mark()
         conf['wx'] = os.path.join(inst, 'bin', 'wx-config')
         conf['wx_man'] = self.manifest()
@@ -1190,10 +1298,11 @@ class WxRepo(Repo):
         # OTP < 26 => wx 3.0/3.1 compat 2.8
         # OTP < ?? => wx 3.2/3.3 compat 3.0
         otp_rel = conf['rel']
-        use_v30 = otp_rel < 20
+        # use_v30 = otp_rel < 20 or conf['os_type'].endswith('BSD')
         # use_v30 = otp_rel < 26
-        branch = 'WX_3_0_BRANCH' if use_v30 else 'master'
-        origin = 'https://github.com/wxWidgets/wxWidgets.git'
+        use_v30 = otp_rel < 20
+        branch  = 'WX_3_0_BRANCH' if use_v30 else 'master'
+        origin  = 'https://github.com/wxWidgets/wxWidgets.git'
         super().__init__(conf, origin, branch)
         if use_v30:
             dsc = self._git_cap(['describe'])
@@ -1226,30 +1335,13 @@ class WxRepo(Repo):
 
     _label = 'wxWidgets'
 
+    @staticmethod
+    def _check_supported(conf: Config) -> CheckSupportedResult:
+        systype = conf['systype']
+        label   = f"{WxRepo._label}-{systype}"
+        return True, label
 
-def _wx_supported(conf: Config) -> SupportedFunResult:
-    label = WxRepo._label
-    if not conf['wx']:
-        return True, label + ' disabled'
-    os_type = conf['os_type']
-    os_arch = conf['os_arch']
-    systype = f"{os_type}-{os_arch}"
-    label = f"{label}-{systype}"
-    rel = conf['rel']
-    if rel == 24:
-        # OTP wx app rewritten
-        if systype == 'Darwin-arm64':
-            return False, label + ' undefined NIF symbols'
-    # if conf['rel'] >= 17 :
-    #     return True, label
-    # if os_arch == 'x86_64' :
-    #     # x86_64 - drivers/common/inet_drv.c doesn't compile
-    #     return False, systype
-    return True, label
-
-
-_platform_check.append(_wx_supported)
-
+Main._platform_check.append(WxRepo._check_supported)
 
 # Do not raise an exception on non-success result codes, so they can be
 # handled by evaluating http.client.HTTPResponse.status.
@@ -1257,9 +1349,7 @@ class _UrlOpenerErrorHandler(urllib.request.HTTPErrorProcessor):
     http_response = lambda self, request, response: response
     https_response = http_response
 
-
 _opener: Union[urllib.request.OpenerDirector, None] = None
-
 
 def _url_opener() -> urllib.request.OpenerDirector:
     global _opener
@@ -1267,17 +1357,14 @@ def _url_opener() -> urllib.request.OpenerDirector:
         _opener = urllib.request.build_opener(_UrlOpenerErrorHandler)
     return _opener
 
-
 # ========================================================================
 # Helpers
 # ========================================================================
 
 BannerSource = Union[str, list[str], tuple[str, ...], dict[str, Any]]
 
-
 def _banner(source: BannerSource, heading=None) -> None:
     print(_banner_text(source, heading), file=LOG_OUT)
-
 
 def _banner_text(source: BannerSource, heading=None) -> str:
     if isinstance(source, str):
@@ -1290,12 +1377,10 @@ def _banner_text(source: BannerSource, heading=None) -> str:
         body = heading + ':\n\n' + body
     return '\n'.join((BANNER, body, BANNER))
 
-
 def _ch_dir(to_dir: str) -> None:
     if to_dir != os.getcwd():
         print(f"==> cd '{to_dir}'", file=LOG_OUT)
         os.chdir(to_dir)
-
 
 def _clean_exit() -> NoReturn:
     _stop_log()
@@ -1326,7 +1411,6 @@ def _download_binary(url: str, dest: str, mode: int) -> None:
         fd.write(bin)
     os.chmod(dest, mode)
 
-
 def _error_exit(msg: Union[str, None], rc: int = 1) -> NoReturn:
     if msg:
         err_msg = 'Error: ' + msg
@@ -1340,11 +1424,11 @@ def _error_exit(msg: Union[str, None], rc: int = 1) -> NoReturn:
     print(err_msg, file=sys.stderr)
     sys.exit(rc)
 
-
 def _ensure_dir(path: str) -> str:
     abs = os.path.abspath(path)
     if not os.path.isdir(abs):
-        print(f"==> mkdir '{path}'", file=LOG_OUT)
+        if not Main._quiet:
+            print(f"==> mkdir '{path}'", file=LOG_OUT)
         if os.path.lexists(path):
             _error_exit(f"'{path}' exists but is not a directory.")
         parent = os.path.dirname(abs)
@@ -1356,7 +1440,8 @@ def _ensure_dir(path: str) -> str:
     return abs
 
 def _exe_cap(cmd: list[str]) -> str:
-    print('==> ' + ' '.join(cmd), file=LOG_OUT)
+    if not Main._quiet:
+        print('==> ' + ' '.join(cmd), file=LOG_OUT)
     res = subprocess.run(
         cmd, check=False, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1371,16 +1456,20 @@ def _exe_cap(cmd: list[str]) -> str:
     return out
 
 def _exe_run(cmd: list[str], ignore_fail: bool = False) -> None:
-    print('==> ' + ' '.join(cmd), file=LOG_OUT)
-    # Logging should always be set up when this is called
+    # Logging will generally be set up when this is called, except for a
+    # couple of edge cases where we're not worried about missing the output.
+    if _log_file or not Main._quiet:
+        print('==> ' + ' '.join(cmd), file=LOG_OUT)
     res = subprocess.run(
         cmd, check=False, stdout=_pipe_out, stderr=_pipe_err)
-    if rc := res.returncode and not ignore_fail:
+    if (rc := res.returncode) and not ignore_fail:
         _error_exit(None, rc)
 
 def _find_compiler(conf: Config) -> Compiler:
     """Return (family, (version), cc_exe, c++_exe)"""
-    # Intel compilers only on x86_64 (duh) Mac or Linux
+    # This function may not be needed after all, but having written it
+    # I'm keeping it.
+    # Only check for Intel compilers on x86_64 (duh) Mac or Linux.
     chk_icc = (conf['os_arch'] == 'x86_64' and
                conf['os_type'] in ('Linux', 'Darwin'))
     cc_srch = ['cc', 'clang', 'gcc']
@@ -1393,16 +1482,16 @@ def _find_compiler(conf: Config) -> Compiler:
         _error_exit('missing C compiler')
     line = _exe_cap([cc, '--version']).split('\n')[0]
     if chk_icc and (re.match(r'Intel\b', line) or
-                    re.search(r'\b\(ICC\)\b', line)):
+                    re.search(r'\bICC\b', line)):
         fam = 'intel'
     elif re.search(r'\bclang\b', line):
         fam = 'clang'
-    elif re.search(r'\b\(GCC\)\b', line):
+    elif re.search(r'\bGCC\b', line):
         fam = 'gcc'
     else:
         fam = 'unknown'
     if vsn := re.search(r'\b\d+(\.\d+){1,}\b', line):
-        vsn = tuple(int(s) for s in vsn[0].split('.'))
+        vsn = _version_to_vsn(vsn[0])
     else:
         vsn = (0,)
     dn, fn = os.path.split(cc)
@@ -1431,7 +1520,6 @@ def _find_exe(name: str, check : bool = False) -> Union[str, None]:
         return None
     _error_exit(f"required executable not found: '{name}'")
 
-
 # returns (make, gmake)
 def _find_make() -> tuple[str, str]:
     make = _find_exe('make')
@@ -1443,7 +1531,6 @@ def _find_make() -> tuple[str, str]:
         return make, make
     gmake = _find_exe('gmake')
     return make, gmake
-
 
 def _prefix_path(*dirs: str) -> Union[str, None]:
     prev_path = os.environ['PATH']
@@ -1458,12 +1545,10 @@ def _prefix_path(*dirs: str) -> Union[str, None]:
         return prev_path
     return None
 
-
 def _restore_path(prev_path: str) -> None:
     if prev_path:
         os.environ['PATH'] = prev_path
         print(f"$PATH reset to '{prev_path}'", file=LOG_OUT)
-
 
 def _show_file(path: str, desc: str) -> None:
     msg = desc + ': ' + path
@@ -1473,11 +1558,15 @@ def _show_file(path: str, desc: str) -> None:
     if platform.system() == 'Darwin':
         _exe_run(['/usr/bin/open', path])
 
-
 def _read_file(path: str) -> str:
     with open(path, 'rt', encoding='latin_1', errors='ignore') as fd:
         return fd.read()
 
+def _version_to_vsn(vstr: str) -> Vsn:
+    return tuple(int(s) for s in vstr.split('.') if s.isdecimal())
+
+def _vsn_to_version(vsn: Vsn) -> str:
+    return '.'.join(str(i) for i in vsn)
 
 def _write_file(path: str,
                 content: Union[str, None] = None,
@@ -1488,7 +1577,6 @@ def _write_file(path: str,
         if content:
             return fd.write(content)
     return 0
-
 
 # ========================================================================
 # Text
@@ -1534,7 +1622,6 @@ unset   _activate_dir
 hash -r 2>/dev/null || true
 '''
 
-
 # ========================================================================
 # Logging
 # ========================================================================
@@ -1543,18 +1630,16 @@ hash -r 2>/dev/null || true
 # redirecting output from subprocess.run/Popen.
 
 def _dbg_cfg(conf: Config, heading: str) -> None:
-    if DEBUG:
+    if Main._dump:
         for line in _banner_text(conf, heading=heading).split('\n'):
             logging.debug(line)
 
-
 def _dbg_env(heading: str) -> None:
-    if DEBUG:
+    if Main._dump:
         lines = ['  ' + s for s in
                  sorted(_exe_cap(['/usr/bin/env']).split('\n'))]
         for line in _banner_text(lines, heading=heading).split('\n'):
             logging.debug(line)
-
 
 class _LogStream(io.TextIOBase):
     """
@@ -1605,18 +1690,15 @@ class _LogStream(io.TextIOBase):
             self._log_func(buf)
             self._buf = ''
 
-
 class LogOut(_LogStream):
     def __init__(self):
         _LogStream.__init__(self, logging.info)
         self.name = 'LogOut'
 
-
 class LogErr(_LogStream):
     def __init__(self):
         _LogStream.__init__(self, logging.error)
         self.name = 'LogErr'
-
 
 class _LogPipe(_LogStream, threading.Thread):
     """
@@ -1658,20 +1740,17 @@ class _LogPipe(_LogStream, threading.Thread):
         # cnt == 0 => EOF, meaning the pipe's write fd has been closed
         reader.close()
 
-
 class PipeOut(_LogPipe):
     def __init__(self):
         _LogPipe.__init__(self, 'LogPipeOut', logging.info)
-
 
 class PipeErr(_LogPipe):
     def __init__(self):
         _LogPipe.__init__(self, 'LogPipeErr', logging.error)
 
-
 def _start_log(log_file: str) -> None:
     global _log_file, _pipe_out, _pipe_err, LOG_OUT, LOG_ERR
-    level = logging.DEBUG if DEBUG else logging.INFO
+    level = logging.DEBUG if Main._dump else logging.INFO
     logging.basicConfig(
         filename=log_file, filemode='wt',
         encoding='latin_1', errors='ignore',
@@ -1692,7 +1771,6 @@ def _start_log(log_file: str) -> None:
     LOG_ERR = log_err
     atexit.register(_stop_log)
 
-
 def _stop_log():
     global _log_file, _pipe_out, _pipe_err, LOG_OUT, LOG_ERR
     _log_file = None
@@ -1709,7 +1787,6 @@ def _stop_log():
         LOG_ERR.flush()
         LOG_ERR = sys.stderr
     atexit.unregister(_stop_log)
-
 
 # _log_file also operates as a semaphore for whether logging is hooked up
 _log_file: Union[str, None] = None
@@ -1729,7 +1806,5 @@ LOG_ERR = sys.stderr
 # ========================================================================
 # Run the program
 # ========================================================================
-
-DEBUG: bool = True
 
 Main().run()
