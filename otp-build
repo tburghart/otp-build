@@ -825,15 +825,15 @@ class OTPRepo(Repo):
         cxflags = cflags
         ldflags = '-O3 -g0'
         rel     = conf['rel']
-        if rel > 21:
-            cflags  += ' -std=gnu17'
-            cxflags += ' -std=gnu++17'
-        elif rel > 16:
-            cflags  += ' -std=gnu11'
-            cxflags += ' -std=gnu++11'
-        else:
-            cflags  += ' -std=gnu99'
-            cxflags += ' -std=gnu++03'
+        # if rel > 21:
+        #     cflags  += ' -std=gnu17'
+        #     cxflags += ' -std=gnu++17'
+        # elif rel > 16:
+        #     cflags  += ' -std=gnu11'
+        #     cxflags += ' -std=gnu++11'
+        # else:
+        #     cflags  += ' -std=gnu99'
+        #     cxflags += ' -std=gnu++03'
         if conf['os_type'] == 'Darwin':
             vsn_flag = ' -mmacosx-version-min=' + conf['mac_min_vsn']
             cflags  += vsn_flag
@@ -854,7 +854,7 @@ class OTPRepo(Repo):
         # ??  ODBC compilable
         if rel < 19 and darwin:
             cfg.append('--enable-darwin-64bit')
-        elif conf['os_arch'] == 'x86_64':
+        elif conf['os_arch'] == 'x86_64' or conf['compiler'][0] != 'gcc':
             cfg.append('--enable-m64-build')
         # if rel >= 23 :
         #     cfg.append('--enable-pie')
@@ -882,7 +882,7 @@ class OTPRepo(Repo):
             cfg.append('--without-et')
             cfg.append('--without-observer')
         # if darwin:
-        #     # OTP-20 tells us to set this, but then ignores it :(
+        #     # OTP-20 tells us to set this, but ignores it :(
         #     os.environ['MACOSX_DEPLOYMENT_TARGET'] = conf['mac_min_vsn']
         return cfg
 
